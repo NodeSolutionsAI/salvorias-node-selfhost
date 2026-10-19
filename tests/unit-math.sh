@@ -64,6 +64,28 @@ check_false "leading zeros ignored" wei_lt 0010 9
 check "reserve plus 90 check-ins" "$(wei_times 212500000000000 91)" "19337500000000000"
 check "check-ins left" "$(checkins_left 1000000000000000000 212500000000000)" "4705"
 
+echo "## whole numbers (they go into bash arithmetic, where 08 is invalid octal)"
+check_true "0 is a whole number" is_uint 0
+check_true "8 is a whole number" is_uint 8
+check_true "10 is a whole number" is_uint 10
+check_true "a 30-digit wei amount is a whole number" is_uint 123456789012345678901234567890
+check_false "08 is refused" is_uint 08
+check_false "010 is refused" is_uint 010
+check_false "00 is refused" is_uint 00
+check_false "empty is refused" is_uint ""
+check_false "-1 is refused" is_uint -1
+check_false "1a is refused" is_uint 1a
+check_false "' 1' is refused" is_uint " 1"
+# Every value is_uint accepts must work in arithmetic, which 08 did not:
+# 0 to 120, with and without a leading zero.
+bad=""
+for n in $(seq 0 120); do
+  for v in "$n" "0$n"; do
+    if is_uint "$v" && ! (bash -c "(( $v >= 0 ))") 2>/dev/null; then bad+="$v "; fi
+  done
+done
+check "accepted values all work in arithmetic" "$bad" ""
+
 echo "## funding text"
 # The slot-info --node object returned by mainnet (max fee 2.125 gwei).
 # shellcheck disable=SC2034

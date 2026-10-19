@@ -260,6 +260,16 @@ expect_rc 2 "a release repo with % is refused"
 run short-watch env SALVORIAS_UPGRADE_WATCH_SECONDS=5 bash "$INSTALL" status
 expect_rc 2 "an upgrade watch under 10s is refused"
 expect_log short-watch 'at least 10' "minimum watch explained"
+# bash arithmetic reads 08 as invalid octal; it must be a usage error instead.
+run octal-wait bash "$INSTALL" --network testnet --binary "$BIN" --owner "$OWNER" --wait-minutes 08
+expect_rc 2 "--wait-minutes 08 is refused as bad input"
+expect_log octal-wait 'must be a whole number of minutes' "leading zero explained"
+expect_no_log octal-wait 'value too great for base' "no bash arithmetic error"
+run octal-poll env SALVORIAS_POLL_SECONDS=08 bash "$INSTALL" status
+expect_rc 2 "SALVORIAS_POLL_SECONDS=08 is refused as bad input"
+expect_no_log octal-poll 'value too great for base' "no bash arithmetic error (poll)"
+run octal-watch env SALVORIAS_UPGRADE_WATCH_SECONDS=010 bash "$INSTALL" status
+expect_rc 2 "SALVORIAS_UPGRADE_WATCH_SECONDS=010 is refused as bad input"
 printf '#!/bin/sh\necho "salvorias-node v9.9.9"\n' >/root/script-node
 chmod 0755 /root/script-node
 run elf-script bash "$INSTALL" --network testnet --binary /root/script-node --owner "$OWNER"
@@ -345,9 +355,15 @@ section "4b. the testnet contract as deployed (no nodeToSlot getter)"
 run slot-info-testnet "$BIN" slot-info --rpc-url "$TESTNET_RPC" --contract "$TESTNET_CHECKIN" --owner "$OWNER" --node "$PROBE_NODE"
 expect_rc 0 "slot-info --node works against https://testnet.salvorias.net (read-only)"
 expect_log slot-info-testnet '"boundSlotSource":null' "reports boundSlotSource for an unbound node"
+# This install also runs with a salvorias account made beforehand, outside
+# the installer. check_existing_user accepts it; the purge below must keep it.
+useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin salvorias
+PRE_UID="$(id -u salvorias)"
 bind_when_ready "$FAITHFUL_STATE" 4 &
 run faithful env SALVORIAS_POLL_SECONDS=3 bash "$INSTALL" --network testnet --rpc-url "$FAITHFUL_RPC" --binary "$BIN" --owner "$OWNER" --wait-minutes 3
 expect_rc 0 "a full install against the testnet contract shape completes"
+expect_log faithful 'Using the existing system user salvorias. This installer did not create it' "the pre-made account is used, and named as not the installer's"
+expect_true "state records the account as not created by the installer" grep -qx 'ACCOUNT_CREATED=no' /etc/salvorias/selfhost.conf
 expect_no_log faithful 'Could not read node registration data' "the slot-info --node pre-check passes"
 expect_log faithful 'Registered: node .* \(slot 1\)' "registration found through the slot scan"
 FNODE="$(cat "$DATA/node-address.txt")"
@@ -357,6 +373,12 @@ run faithful-purge with_tty "uninstall
 delete node key
 " "$SELF uninstall --purge-key"
 expect_rc 0 "purge after the faithful-contract install"
+expect_log faithful-purge 'It keeps the salvorias system user: this installer did not create it' "purge says up front that it keeps the account"
+expect_log faithful-purge 'Kept the salvorias user: this installer did not create it' "purge reports the account kept"
+expect_no_log faithful-purge 'Deleted the salvorias user' "purge does not delete the pre-made account"
+expect_true "the pre-made account still exists, same UID" test "$(id -u salvorias 2>/dev/null)" = "$PRE_UID"
+expect_true "everything else removed" test ! -e /etc/salvorias -a ! -e /opt/salvorias -a ! -e "$DATA" -a ! -e "$SELF"
+userdel salvorias
 rm -f "$FAITHFUL_STATE/bound-node"
 expect_true "server clean again" nothing_installed
 
@@ -383,6 +405,8 @@ NODE="$(cat "$DATA/node-address.txt")"
 echo "Node address: $NODE"
 expect_true "state is awaiting-registration" grep -q '^STAGE=awaiting-registration$' /etc/salvorias/selfhost.conf
 expect_true "service not installed while unregistered" test ! -e /etc/systemd/system/salvorias-node.service
+expect_log piped-timeout 'Created system user: salvorias' "the installer created the account"
+expect_true "state records the account as created by the installer" grep -qx 'ACCOUNT_CREATED=yes' /etc/salvorias/selfhost.conf
 
 section "6. one node per server while waiting"
 run second-while-waiting bash "$INSTALL" --network testnet --rpc-url "$MOCK_RPC" --binary "$BIN" --owner "$OWNER"
@@ -526,6 +550,50 @@ run second-installed bash "$INSTALL" --network testnet --rpc-url "$MOCK_RPC" --b
 expect_rc 1 "second install refused"
 expect_log second-installed 'Only one node per server' "one-node message"
 
+section "10b. one changing command at a time: a held lock stops install, uninstall and the rest"
+LOCK=/run/salvorias-selfhost.lock
+expect_stat "$LOCK" "600 root:root"
+# A stand-in for a running salvorias-selfhost: a process holding the lock.
+( exec 9<>"$LOCK"; flock 9; exec sleep 300 ) &
+LOCK_HOLDER=$!
+PIDS+=("$LOCK_HOLDER")
+for _ in $(seq 1 50); do flock -n "$LOCK" true || break; sleep 0.1; done
+expect_true "the lock is held by the stand-in" bash -c "! flock -n $LOCK true"
+run locked-install bash "$INSTALL" --network testnet --rpc-url "$MOCK_RPC" --binary "$BIN" --owner "$OWNER"
+expect_rc 4 "install refused while the lock is held"
+expect_log locked-install 'Another salvorias-selfhost command is running on this server' "install names the running command"
+expect_no_log locked-install 'Only one node per server' "install stopped at the lock, before any other check"
+run locked-uninstall "$SELF" uninstall --yes
+expect_rc 4 "uninstall --yes refused while the lock is held"
+expect_log locked-uninstall 'Another salvorias-selfhost command is running on this server' "uninstall names the running command"
+expect_true "uninstall changed nothing: service active, config and unit file there" \
+  bash -c 'systemctl is-active --quiet salvorias-node.service && test -f /etc/salvorias/node.env -a -f /etc/systemd/system/salvorias-node.service -a -x /usr/local/sbin/salvorias-selfhost'
+run locked-resume "$SELF" resume
+expect_rc 4 "resume refused while the lock is held"
+run locked-upgrade "$SELF" upgrade --binary "$BIN_NEXT"
+expect_rc 4 "upgrade refused while the lock is held"
+run locked-rollback "$SELF" upgrade --rollback
+expect_rc 4 "upgrade --rollback refused while the lock is held"
+run locked-backup "$SELF" backup-key --out /root/locked-backup.txt
+expect_rc 4 "backup-key refused while the lock is held"
+expect_true "no backup written" test ! -e /root/locked-backup.txt
+run locked-status "$SELF" status
+expect_rc 0 "status still works while the lock is held (read-only)"
+kill "$LOCK_HOLDER" 2>/dev/null || true
+wait "$LOCK_HOLDER" 2>/dev/null || true
+expect_true "the lock is free again" flock -n "$LOCK" true
+expect_true "still at version 0.0.9" test "$(readlink /opt/salvorias/bin/current)" = 0.0.9
+# A link at the lock path is refused, never opened.
+mv "$LOCK" "$WORK/saved-lock"
+ln -s /root/decoy-profile "$LOCK"
+run lock-link "$SELF" backup-key --out /root/locked-backup.txt
+expect_rc 1 "a link at the lock path is refused"
+expect_log lock-link 'salvorias-selfhost.lock is a symbolic link' "the link is named"
+expect_true "decoys unchanged by the refused lock link" decoys_unchanged
+expect_true "no backup written through the refused lock" test ! -e /root/locked-backup.txt
+rm -f "$LOCK"
+mv "$WORK/saved-lock" "$LOCK"
+
 section "11. status (unfunded, then funded through the mock)"
 run status "$SELF" status
 expect_rc 0 "status"
@@ -621,6 +689,10 @@ printf '\n--- [%02d] $ salvorias-selfhost upgrade --binary next (60s watch, SIGI
 SALVORIAS_UPGRADE_WATCH_SECONDS=60 spawn_sigint_able "$SELF" upgrade --binary "$BIN_NEXT" >"$OUT/upgrade-sigint.log" 2>&1 &
 pid=$!
 sleep 12
+# The upgrade is in its watch now, holding the lock: a real concurrent run.
+run during-upgrade "$SELF" uninstall --yes
+expect_rc 4 "uninstall refused while an upgrade is running"
+expect_log during-upgrade 'Another salvorias-selfhost command is running' "names the running upgrade"
 kill -INT -- "-$pid" 2>/dev/null || echo "    (upgrade had already exited before the signal)"
 set +e; wait "$pid"; RC=$?; set -e
 sed 's/^/    | /' "$OUT/upgrade-sigint.log"; printf '    (exit %s)\n' "$RC"
@@ -695,6 +767,8 @@ expect_true "service, config, binaries and salvorias-selfhost removed" \
   bash -c '[[ ! -e /etc/systemd/system/salvorias-node.service && ! -e /etc/salvorias && ! -e /opt/salvorias && ! -e /usr/local/bin/salvorias-node && ! -e /usr/local/sbin/salvorias-selfhost ]]'
 expect_stat "$DATA/node-key.txt" "600 salvorias:salvorias"
 expect_true "service is gone from systemd" bash -c '! systemctl cat salvorias-node.service >/dev/null 2>&1'
+expect_stat "$DATA/installer-account.txt" "600 root:root"
+expect_true "the kept account is marked as the installer's, by UID" test "$(cat "$DATA/installer-account.txt")" = "UID=$(id -u salvorias)"
 for spec in node-key.txt:/root/decoy-profile node-address.txt:/root/decoy-disk; do
   name="${spec%%:*}"; target="${spec#*:}"
   plant "$name" "$target"
@@ -710,6 +784,8 @@ expect_rc 0 "reinstall with the kept key"
 expect_log reinstall-reuse "kept by an earlier uninstall: $NODE" "kept key reused"
 expect_log reinstall-reuse 'already registered to this wallet' "registration wait skipped"
 expect_no_log reinstall-reuse 'REGISTER THIS NODE' "no registration box"
+expect_log reinstall-reuse 'Using the system user salvorias that this installer created for an earlier install' "the kept account is known to be the installer's"
+expect_true "state still records the account as created by the installer" grep -qx 'ACCOUNT_CREATED=yes' /etc/salvorias/selfhost.conf
 expect_true "salvorias-selfhost installed from the running file" cmp -s "$SELF" "$INSTALL"
 expect_true "service active" systemctl is-active --quiet salvorias-node.service
 data_layout_ok
@@ -724,6 +800,8 @@ run purge with_tty "uninstall
 delete node key
 " "$SELF uninstall --purge-key"
 expect_rc 0 "purge with the typed confirmation"
+expect_log purge 'It also deletes the salvorias system user, which this installer created' "purge says up front it deletes the installer's account"
+expect_log purge 'Deleted the salvorias user' "the installer-created account is deleted"
 expect_true "nothing left after purge" nothing_installed
 
 section "17. install --import-key (server migration)"

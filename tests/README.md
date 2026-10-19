@@ -16,7 +16,8 @@ bash tests/unit-math.sh      # needs bash 4.4+; the e2e suite also runs it in th
 ```
 
 These extract the pure helpers from `install.sh` and test them: wei
-formatting, the funding text (reserve wording and the 90-day suggestion), the
+formatting, whole-number validation (no leading zeros such as `08`, which
+bash arithmetic reads as invalid octal), the funding text (reserve wording and the 90-day suggestion), the
 URL and repo rules, `checksums.txt` parsing (empty file, missing entry,
 `*name` entries, CRLF, conflicting entries), the ELF header check, and the
 version-name pattern (no `..`, leading dot or dash, or slash). One more test
@@ -85,6 +86,9 @@ messages, files, owners and modes.
     and a URL with a quote are refused;
   - a release repo with a newline or `%` is refused;
   - an upgrade watch under 10 seconds is refused;
+  - `--wait-minutes 08`, `SALVORIAS_POLL_SECONDS=08` and
+    `SALVORIAS_UPGRADE_WATCH_SECONDS=010` are refused as bad input (exit 2),
+    not as a bash arithmetic error;
   - a shell script, and an ELF for another CPU, are refused as `--binary`
     before they run;
   - an existing `salvorias` login account is refused, and so are system
@@ -104,7 +108,10 @@ messages, files, owners and modes.
   - `slot-info --node` against https://testnet.salvorias.net itself
     (read-only) succeeds;
   - a full install through a mock that is faithful to that contract: the
-    pre-check passes, and the registration is found by the slot scan.
+    pre-check passes, and the registration is found by the slot scan. It runs
+    with a clean `salvorias` system account made beforehand: the state file
+    records it as not the installer's, and `uninstall --purge-key` keeps it
+    (same UID) and says so.
 - **A licensed owner, simulated through `tests/mock-rpc.py`**
   (explained in the next section):
   - a piped install from a local release, run from a directory holding a
@@ -130,6 +137,13 @@ messages, files, owners and modes.
     chain 7283 to NodeCheckIn's `checkIn`, gas limit 100000, with non-zero
     `maxFeePerGas` and `maxPriorityFeePerGas`;
   - the one-node guard once installed;
+  - **one changing command at a time**: with the lock
+    (`/run/salvorias-selfhost.lock`, 0600 root:root) held by another
+    process, `install`, `uninstall --yes`, `resume`, `upgrade`,
+    `upgrade --rollback` and `backup-key` each exit 4 and change nothing,
+    while `status` still runs. A link at the lock path is refused and its
+    target is untouched. During the Ctrl-C upgrade test below, an
+    `uninstall --yes` started while the upgrade runs is refused the same way;
   - `status`, unfunded and funded;
   - `backup-key`: to a fresh path in a new root-only directory (0600
     root:root, no temp file left), and refused into a symlinked directory,
@@ -153,11 +167,13 @@ messages, files, owners and modes.
     directory, then migrated by `upgrade`;
   - `uninstall` without a terminal (refused), and `uninstall --yes`, which
     keeps the key and removes a staging directory left in the data
-    directory;
+    directory. It leaves a root-only marker naming the account the installer
+    created (by UID), so the reinstall below still records the account as
+    the installer's;
   - planted links stop a reinstall, with the decoys untouched;
   - a reinstall that reuses the kept key;
   - `uninstall --purge-key`, once with a wrong confirmation and once with the
-    right one;
+    right one, which deletes the account the installer created;
   - `install --import-key`: a world-readable file, a link, a two-key file and
     a junk file are each refused, then a bare-hex key is imported and the
     registration wait is skipped because the node is already bound;
