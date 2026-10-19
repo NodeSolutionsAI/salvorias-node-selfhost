@@ -267,6 +267,30 @@ expect_log login-user 'not a locked-down system account' "account problem explai
 expect_log login-user 'allows logins' "names the login shell"
 expect_true "nothing written for the refused account" test ! -e /etc/salvorias -a ! -e "$DATA"
 userdel -r salvorias 2>/dev/null
+# System accounts that look locked down but share access with others.
+useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin salvorias
+usermod -aG adm salvorias
+run user-extra-group bash "$INSTALL" --network testnet --binary "$BIN" --owner "$OWNER"
+expect_rc 1 "a system salvorias account with a supplementary group is refused"
+expect_log user-extra-group 'belongs to other groups \(salvorias adm\)' "names the extra group"
+gpasswd -d salvorias adm >/dev/null
+useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin -g salvorias salvorias-other
+run user-shared-gid bash "$INSTALL" --network testnet --binary "$BIN" --owner "$OWNER"
+expect_rc 1 "a second account with the salvorias primary group is refused"
+expect_log user-shared-gid 'other accounts have the .salvorias. group as their primary group \(salvorias-other\)' "names the other account"
+userdel salvorias-other
+run user-clean bash "$INSTALL" --network testnet --binary "$BIN" --owner "$OWNER"
+expect_rc 3 "a clean system salvorias account passes the account check (then the no-license stop)"
+expect_no_log user-clean 'not a locked-down system account' "no account problem reported"
+userdel salvorias
+groupadd -g 1500 salvorias
+useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin -g salvorias salvorias
+run user-gid bash "$INSTALL" --network testnet --binary "$BIN" --owner "$OWNER"
+expect_rc 1 "a salvorias account whose primary GID is not a system GID is refused"
+expect_log user-gid 'primary GID 1500 is not a system GID' "names the GID"
+userdel salvorias
+groupdel salvorias 2>/dev/null || true
+expect_true "nothing written for the refused accounts" test ! -e /etc/salvorias -a ! -e "$DATA"
 
 section "2. no license: stop before installing anything (real testnet, random owner)"
 run no-license bash "$INSTALL" --network testnet --binary "$BIN" --owner "$OWNER"
@@ -388,6 +412,22 @@ expect_log resume-fail 'could not be started' "failed start explained"
 expect_no_log resume-fail 'Salvorias node installed' "no installed summary after a failed start"
 expect_true "stage is starting, not installed" grep -q '^STAGE=starting$' /etc/salvorias/selfhost.conf
 expect_true "service is not active" bash -c '! systemctl is-active --quiet salvorias-node.service'
+# Now the start succeeds, but the daemon (tests/broken-node.js, built) exits
+# 3 seconds later, inside the installer's post-start watch. A copy outside
+# /tmp and /root, which the unit's PrivateTmp and ProtectHome hide.
+install -m 0755 "$BIN_BROKEN" /usr/local/lib/salvorias-e2e-broken-node
+printf '[Service]\nExecStart=\nExecStart=/bin/sh -c "sleep 3; exec /usr/local/lib/salvorias-e2e-broken-node start"\n' \
+  >/etc/systemd/system/salvorias-node.service.d/e2e-fail.conf
+systemctl daemon-reload
+systemctl stop salvorias-node.service 2>/dev/null || true
+systemctl reset-failed salvorias-node.service 2>/dev/null || true
+run resume-crash "$SELF" resume --wait-minutes 1
+expect_rc 1 "resume reports a daemon that crashes during the watch"
+expect_log resume-crash 'started but did not stay up' "crash during the watch explained"
+expect_log resume-crash 'broken build: refusing to start' "the journal shown has the crash"
+expect_no_log resume-crash 'Salvorias node installed' "no installed summary after the crash"
+expect_true "stage is still starting after the crash, so resume can retry" grep -q '^STAGE=starting$' /etc/salvorias/selfhost.conf
+rm -f /usr/local/lib/salvorias-e2e-broken-node
 rm -rf /etc/systemd/system/salvorias-node.service.d
 systemctl daemon-reload
 # Clear the failed state, so a pending automatic restart cannot race the resume.
@@ -496,6 +536,28 @@ expect_stat /root/node-key-backup.txt "600 root:root"
 expect_true "backup matches the node key" cmp -s /root/node-key-backup.txt "$DATA/node-key.txt"
 run backup-again "$SELF" backup-key --out /root/node-key-backup.txt
 expect_rc 1 "backup-key refuses to overwrite"
+install -d -m 0700 /root/bk-fresh
+run backup-fresh "$SELF" backup-key --out /root/bk-fresh/key.txt
+expect_rc 0 "backup-key to a fresh path in a new root-only directory"
+expect_stat /root/bk-fresh/key.txt "600 root:root"
+expect_true "the fresh backup matches the node key" cmp -s /root/bk-fresh/key.txt "$DATA/node-key.txt"
+expect_true "no temp file left beside it" test -z "$(find /root/bk-fresh -name '.salvorias-key-backup.*')"
+ln -s /root/bk-fresh /root/bk-link
+run backup-symdir "$SELF" backup-key --out /root/bk-link/key2.txt
+expect_rc 1 "backup-key into a symlinked directory is refused"
+expect_log backup-symdir 'is a symbolic link' "explains the link"
+expect_true "nothing written through the link" test ! -e /root/bk-fresh/key2.txt
+install -d -m 0700 -o nobody /root/bk-user
+run backup-userdir "$SELF" backup-key --out /root/bk-user/key.txt
+expect_rc 1 "backup-key into a directory another user owns is refused"
+expect_log backup-userdir 'not owned by root' "explains the owner"
+install -d -m 1777 /root/bk-open
+run backup-opendir "$SELF" backup-key --out /root/bk-open/key.txt
+expect_rc 1 "backup-key into a world-writable directory is refused"
+expect_log backup-opendir 'can be written by users other than root' "explains the mode"
+expect_true "nothing written in the refused directories" test -z "$(find /root/bk-user /root/bk-open -mindepth 1)"
+shred -u /root/bk-fresh/key.txt
+rm -rf /root/bk-fresh /root/bk-link /root/bk-user /root/bk-open
 
 section "12b. links planted in $DATA: backup-key and purge refuse, targets untouched"
 for spec in node-key.txt:/root/decoy-profile node-address.txt:/root/decoy-disk; do
@@ -516,6 +578,12 @@ delete node key
   expect_true "decoys unchanged: owner, mode, size, links and hash ($name)" decoys_unchanged
   unplant "$name"
 done
+ln "$DATA/node-key.txt" /root/e2e-key-hardlink
+run backup-hardlink "$SELF" backup-key --out /root/should-not-exist-hardlink
+expect_rc 1 "backup-key refuses a key with another hard link"
+expect_log backup-hardlink 'has another hard link' "says another hard link exists"
+expect_log backup-hardlink "find / -xdev -samefile $DATA/node-key.txt" "suggests how to find it"
+rm -f /root/e2e-key-hardlink
 data_layout_ok
 
 section "13. upgrade rollback with a broken binary; binaries that are not for this server"
@@ -526,6 +594,7 @@ expect_log upgrade-broken 'Rolled back to 0.0.9, which is running again' "old ve
 expect_true "current -> 0.0.9 after rollback" test "$(readlink /opt/salvorias/bin/current)" = 0.0.9
 expect_true "broken version dir removed" test ! -e /opt/salvorias/bin/0.0.10-broken
 expect_true "service active after rollback" systemctl is-active --quiet salvorias-node.service
+expect_no_log upgrade-broken 'changed on disk' "no stale-unit warning: an unchanged unit file is not rewritten"
 
 head -c 4096 /dev/urandom >/root/garbage-node
 run upgrade-garbage "$SELF" upgrade --binary /root/garbage-node
@@ -564,6 +633,7 @@ expect_true "salvorias-selfhost refreshed from the release" cmp -s "$SELF" "$WOR
 run upgrade-same env SALVORIAS_RELEASE_BASE_URL=http://127.0.0.1:8001 "$SELF" upgrade
 expect_rc 0 "upgrade to the same binary"
 expect_log upgrade-same 'Already running this binary' "no-op when already current and running"
+expect_no_log upgrade-same 'Updated /etc/systemd/system' "the unchanged unit file is left alone"
 systemctl stop salvorias-node.service
 run upgrade-stopped env SALVORIAS_RELEASE_BASE_URL=http://127.0.0.1:8001 "$SELF" upgrade
 expect_rc 0 "upgrade with the service stopped"
@@ -604,8 +674,11 @@ expect_true "service active after the migration" systemctl is-active --quiet sal
 section "15. uninstall (keeps the key); planted links stop a reinstall; then reinstall reuses the key"
 run uninstall-notty setsid -w "$SELF" uninstall
 expect_rc 2 "uninstall without a terminal and without --yes is refused"
+install -d -m 0700 "$DATA/.stage.e2ekeep"
+printf 'e2e: not a key\n' >"$DATA/.stage.e2ekeep/node-key.txt"
 run uninstall-keep "$SELF" uninstall --yes
 expect_rc 0 "uninstall --yes"
+expect_true "a staging directory left in $DATA is removed" test ! -e "$DATA/.stage.e2ekeep"
 expect_log uninstall-keep 'clear it in the Salvorias app' "slot reminder"
 expect_true "service, config, binaries and salvorias-selfhost removed" \
   bash -c '[[ ! -e /etc/systemd/system/salvorias-node.service && ! -e /etc/salvorias && ! -e /opt/salvorias && ! -e /usr/local/bin/salvorias-node && ! -e /usr/local/sbin/salvorias-selfhost ]]'
@@ -672,8 +745,29 @@ data_layout_ok
 expect_true "service active" systemctl is-active --quiet salvorias-node.service
 
 section "17b. import with a key kept by an uninstall: same key in another format is fine, a different key is not"
+mkdir -p /etc/systemd/system/salvorias-node.service.d
+printf '[Unit]\nRefuseManualStop=yes\n' >/etc/systemd/system/salvorias-node.service.d/e2e-refuse.conf
+systemctl daemon-reload
+run uninstall-refused "$SELF" uninstall --yes
+expect_rc 1 "uninstall fails when the service will not stop"
+expect_log uninstall-refused 'is still running \(state: active\)' "says the service is still running"
+expect_no_log uninstall-refused 'Removed' "reports nothing as removed"
+expect_true "nothing removed: config, unit file and salvorias-selfhost still there" \
+  test -f /etc/salvorias/node.env -a -f /etc/systemd/system/salvorias-node.service -a -x "$SELF"
+expect_true "service still active" systemctl is-active --quiet salvorias-node.service
+rm -rf /etc/systemd/system/salvorias-node.service.d
+systemctl daemon-reload
+# The unit file disappears while the service stays loaded and running.
+mv /etc/systemd/system/salvorias-node.service "$WORK/saved-unit"
+expect_true "service still active with its unit file gone" systemctl is-active --quiet salvorias-node.service
 run uninstall-keep-2 "$SELF" uninstall --yes
-expect_rc 0 "uninstall --yes (keeps the key)"
+expect_rc 0 "uninstall --yes with the unit file gone (keeps the key)"
+expect_log uninstall-keep-2 'Stopped and removed the service' "reports the service removed"
+expect_true "the loaded service was stopped" bash -c '! systemctl is-active --quiet salvorias-node.service'
+expect_true "systemd no longer has the unit" test "$(systemctl show -p LoadState --value salvorias-node.service)" = not-found
+expect_true "no boot link left" test ! -L /etc/systemd/system/multi-user.target.wants/salvorias-node.service
+expect_true "no process runs as salvorias" bash -c '! pgrep -u salvorias >/dev/null'
+rm -f "$WORK/saved-unit"
 "$BIN" keygen --out /root/import-other.txt >/dev/null
 run import-other bash "$INSTALL" --network testnet --rpc-url "$MOCK_RPC" --binary "$BIN" --owner "$OWNER" --import-key /root/import-other.txt
 expect_rc 1 "a different key is refused"
@@ -689,11 +783,19 @@ data_layout_ok
 expect_true "service active" systemctl is-active --quiet salvorias-node.service
 journalctl -u salvorias-node.service --no-pager -n 400 >"$OUT/journal-final.log" 2>&1 || true
 
-section "18. final purge"
+section "18. final purge, with leftovers of an interrupted run"
+printf 'e2e stray\n' >/usr/local/sbin/.salvorias-selfhost.e2eXYZ
+printf 'e2e stray\n' >/etc/systemd/system/.salvorias-node.service.e2eXYZ
+install -d -m 0700 "$DATA/.stage.e2eXYZ"
+printf 'e2e: not a key\n' >"$DATA/.stage.e2eXYZ/node-key.txt"
 run purge-final with_tty "uninstall
 delete node key
 " "$SELF uninstall --purge-key"
 expect_rc 0 "final purge"
+expect_log purge-final 'Removed 3 file\(s\) left by an interrupted run' "leftovers reported"
+expect_log purge-final 'Deleted the salvorias user' "user deletion reported"
+expect_true "leftover temp files removed" \
+  test ! -e /usr/local/sbin/.salvorias-selfhost.e2eXYZ -a ! -e /etc/systemd/system/.salvorias-node.service.e2eXYZ
 expect_true "server clean" nothing_installed
 
 section "19. no transactions, no key in any output"
@@ -719,6 +821,11 @@ for n in "$NODE" "$FNODE"; do
   echo "    testnet nonce of $n: ${got:-unreadable}"
   expect_true "no transaction from $n ever reached testnet (nonce 0)" test "$got" = 0x0
 done
+if grep -rl 'changed on disk' "$OUT" >/dev/null; then
+  fail "a stale-unit warning appears in: $(grep -rl 'changed on disk' "$OUT" | xargs -n1 basename | tr '\n' ' ')"
+else
+  pass "no 'unit file changed on disk' warning in any captured output"
+fi
 KEYHEX="$(sed 's/^0x//' /root/node-key-backup.txt)"
 OTHERHEX="$(sed 's/^0x//' /root/import-other.txt)"
 if grep -rqiF -e "$KEYHEX" -e "$OTHERHEX" "$OUT"; then fail "a node key appears in captured output"; else pass "no node key in any captured output or journal"; fi

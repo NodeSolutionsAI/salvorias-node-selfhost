@@ -18,7 +18,10 @@ bash tests/unit-math.sh      # needs bash 4.4+; the e2e suite also runs it in th
 These extract the pure helpers from `install.sh` and test them: wei
 formatting, the funding text (reserve wording and the 90-day suggestion), the
 URL and repo rules, `checksums.txt` parsing (empty file, missing entry,
-`*name` entries, CRLF, conflicting entries) and the ELF header check.
+`*name` entries, CRLF, conflicting entries), the ELF header check, and the
+version-name pattern (no `..`, leading dot or dash, or slash). One more test
+runs the real `on_signal` and `undo_upgrade` with a slowed `switch_current`
+and interrupts the switch back: the run must still end on the old version.
 
 ## End-to-end, in a disposable VM
 
@@ -83,7 +86,11 @@ messages, files, owners and modes.
   - an upgrade watch under 10 seconds is refused;
   - a shell script, and an ELF for another CPU, are refused as `--binary`
     before they run;
-  - an existing `salvorias` login account is refused, and nothing is written;
+  - an existing `salvorias` login account is refused, and so are system
+    accounts that share access: one with a supplementary group, one whose
+    primary GID is not a system GID, and one whose group is another
+    account's primary group. A clean system account passes. Nothing is
+    written;
   - the **no-license stop**, after which nothing is installed;
   - a **piped run** (`cat install.sh | bash -s --`) that reads its prompts
     from `/dev/tty`: a typed private key and a seed phrase are both rejected,
@@ -108,7 +115,10 @@ messages, files, owners and modes.
   - Ctrl-C during `resume`;
   - `resume` while the owner "registers" the node mid-wait, with the service
     start forced to fail (a drop-in with `ExecStartPre=/bin/false`): the
-    install stays at stage `starting`, and a second `resume` starts it;
+    install stays at stage `starting`. Then a daemon that starts and crashes
+    3 seconds later, inside the post-start watch (the `broken/` binary run
+    through a drop-in): the install still stays at `starting`. A last
+    `resume` starts it;
   - the running service: active, enabled, no restarts, network gas mode;
   - every file mode and owner, including the root-owned data directory that
     the service user cannot write to, the system user, `node.env`, and a unit
@@ -120,12 +130,17 @@ messages, files, owners and modes.
     `maxFeePerGas` and `maxPriorityFeePerGas`;
   - the one-node guard once installed;
   - `status`, unfunded and funded;
-  - `backup-key`;
+  - `backup-key`: to a fresh path in a new root-only directory (0600
+    root:root, no temp file left), and refused into a symlinked directory,
+    a directory another user owns and a world-writable one;
   - **planted links**: `node-key.txt`, then `node-address.txt`, replaced by a
     link to a decoy file. `backup-key` and `uninstall --purge-key` each
-    refuse, and the decoys keep their owner, mode, size, link count and hash;
+    refuse, and the decoys keep their owner, mode, size, link count and hash.
+    A second hard link to the key is refused too, with the `find -samefile`
+    hint;
   - **upgrade rollback** with a binary that passes the version check but
-    fails as a daemon;
+    fails as a daemon (and no "unit file changed on disk" warning: an
+    unchanged unit file is not rewritten);
   - an upgrade with random bytes, and with an ELF for another CPU (both
     refused before they run);
   - Ctrl-C during the upgrade watch, which switches back;
@@ -136,7 +151,8 @@ messages, files, owners and modes.
     `ReadWritePaths` in the unit): refused while a planted link is in the
     directory, then migrated by `upgrade`;
   - `uninstall` without a terminal (refused), and `uninstall --yes`, which
-    keeps the key;
+    keeps the key and removes a staging directory left in the data
+    directory;
   - planted links stop a reinstall, with the decoys untouched;
   - a reinstall that reuses the kept key;
   - `uninstall --purge-key`, once with a wrong confirmation and once with the
@@ -144,14 +160,21 @@ messages, files, owners and modes.
   - `install --import-key`: a world-readable file, a link, a two-key file and
     a junk file are each refused, then a bare-hex key is imported and the
     registration wait is skipped because the node is already bound;
+  - `uninstall` while the service refuses to stop (a `RefuseManualStop=yes`
+    drop-in): it fails and removes nothing. Then `uninstall` with the unit
+    file deleted while the service is still loaded and running: the service
+    is stopped and unloaded, and no boot link is left;
   - with a key kept by an uninstall: a different key is refused, and the
     same key in upper-case hex (different bytes) is accepted by address;
-  - a final purge, which leaves a clean server.
+  - a final purge with leftovers of an interrupted run planted (temp copies
+    of `salvorias-selfhost` and the unit file, a staging directory), which
+    removes them and leaves a clean server.
 - **Leak checks:**
   - the installer itself never tried to send a transaction, and no send
     reached the chain (every attempt was refused by a mock);
   - no node key appears in any captured output or journal line, and the
-    fake typed key appears in no captured log.
+    fake typed key appears in no captured log;
+  - no "unit file changed on disk" warning appears in any captured output.
 
 ### The mock RPC (test-only)
 

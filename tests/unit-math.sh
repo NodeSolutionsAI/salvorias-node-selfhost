@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Unit tests for install.sh's pure helpers: wei formatting and comparison,
-# the funding text, URL and repo validation, checksums.txt parsing and the
-# ELF header check. The functions (and the regex variables they use) are
+# the funding text, URL and repo validation, checksums.txt parsing, the ELF
+# header check, the version-name pattern and an interrupt during the
+# upgrade's switch back. The functions (and the regex variables they use) are
 # extracted from install.sh by name, so main never runs and nothing on the
 # system is touched.
 set -euo pipefail
@@ -17,7 +18,7 @@ extract() {
 extract_var() { grep -m 1 "^$1=" install.sh; }
 
 src=""
-for var in URL_PORT_RE URL_PATH_RE LOCAL_HTTP_RE HTTPS_URL_RE REPO_RE; do
+for var in URL_PORT_RE URL_PATH_RE LOCAL_HTTP_RE HTTPS_URL_RE REPO_RE VERSION_LINE_SED; do
   body=$(extract_var "$var")
   [[ -n "$body" ]] || { echo "FAIL: could not extract $var from install.sh"; exit 1; }
   src+="$body"$'\n'
@@ -152,6 +153,40 @@ check_false "empty file" check_elf "$T/empty-bin"
 ASSET_ARCH=linux-x64
 check_true "x86-64 ELF on x86-64" check_elf "$T/x64"
 check_false "arm64 ELF on x86-64" check_elf "$T/arm64"
+
+echo "## version names (they become directories under /opt/salvorias/bin)"
+version_of() { printf '%s\n' "$1" | sed -n "$VERSION_LINE_SED" | head -n 1; }
+check "a release version" "$(version_of 'salvorias-node v0.0.9')" "0.0.9"
+check "a build suffix" "$(version_of 'salvorias-node v0.0.10-broken')" "0.0.10-broken"
+check "'..' is not a version" "$(version_of 'salvorias-node v..')" ""
+check "a leading dot is not a version" "$(version_of 'salvorias-node v.hidden')" ""
+check "a leading dash is not a version" "$(version_of 'salvorias-node v-rf')" ""
+check "a slash is not a version" "$(version_of 'salvorias-node v0/../x')" ""
+
+echo "## an interrupt during the upgrade's switch back"
+# The real on_signal and undo_upgrade, with a switch_current slowed down so
+# the interrupt lands inside it. The handler must still switch back: the run
+# has to end on old-good, never on the failed version.
+# The quoted lines are the test script's own code, expanded when it runs.
+# shellcheck disable=SC2016
+{
+  printf '%s\n' 'set -euo pipefail' "OUTF=$T/sig.out" 'CUR=new-broken' \
+    'switch_current() { sleep 2; CUR="$1"; }' 'systemctl() { :; }' 'service_stays_up() { return 0; }' \
+    'current_version_name() { printf "%s" "$CUR"; }' 'cmd_hint() { printf x; }' \
+    'BIN_ROOT=/nonexistent UNIT_NAME=u INTERRUPT_HINT=""' \
+    'UPGRADE_ROLLBACK_TO=old-good UPGRADE_PLACED=new-broken UPGRADE_PLACED_NEW=0'
+  extract on_signal
+  extract undo_upgrade
+  printf '%s\n' 'trap '"'"'printf "%s\n" "$CUR" >"$OUTF"'"'"' EXIT' 'trap on_signal INT TERM HUP' 'undo_upgrade'
+} >"$T/sig.sh"
+bash "$T/sig.sh" 2>/dev/null &
+sig_pid=$!
+sleep 1
+kill -TERM "$sig_pid"
+sig_rc=0
+wait "$sig_pid" || sig_rc=$?
+check "interrupted undo exits 130" "$sig_rc" 130
+check "an interrupt inside the switch back still ends on the old version" "$(cat "$T/sig.out" 2>/dev/null)" "old-good"
 
 echo "unit-math: $fails failed"
 [[ "$fails" -eq 0 ]]
