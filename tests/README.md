@@ -106,6 +106,15 @@ against the chain directly. `tests/mock-rpc.py` is a small JSON-RPC proxy:
   registering the node in the app.
 - It **refuses `eth_sendRawTransaction` and `eth_sendTransaction`**, so
   nothing in the test can send a transaction.
+- With `--emulate-node-to-slot` it also answers `nodeToSlot` (0) for
+  unbound nodes.
+  - The mainnet NodeCheckIn implementation has that getter. The testnet
+    deployment (`0x51F6…1fF27`) currently does not, so on testnet a real
+    `salvorias-node slot-info --node` call fails for every node.
+  - The main scenarios use the flag, so the installer's flow runs the way it
+    does on mainnet.
+  - A second, faithful mock (no flag) checks that against the testnet
+    contract as deployed, the installer stops before writing anything.
 
 The installer has no test-only code path. The test points it at the mock
 with the ordinary `--rpc-url http://127.0.0.1:8545`, since plain http is

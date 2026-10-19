@@ -102,9 +102,10 @@ with_tty() {
 # `kill -INT -- -PID` reaches it the way Ctrl-C does: as a signal to the whole
 # foreground group (the installer and whatever it is running). Background jobs
 # of a non-interactive shell otherwise start with SIGINT ignored, which a trap
-# cannot undo.
+# cannot undo. `exec` matters: backgrounding a function forks a subshell, and
+# without it $! would name that subshell instead of the installer's group.
 spawn_sigint_able() {
-  python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setpgid(0, 0); os.execvp(sys.argv[1], sys.argv[1:])' "$@"
+  exec python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setpgid(0, 0); os.execvp(sys.argv[1], sys.argv[1:])' "$@"
 }
 
 OWNER="0x$(openssl rand -hex 20)"
@@ -239,7 +240,7 @@ printf '\n--- [%02d] $ salvorias-selfhost resume (SIGINT after 8s)\n' "$STEP"
 SALVORIAS_POLL_SECONDS=3 spawn_sigint_able "$SELF" resume --wait-minutes 5 >"$OUT/sigint.log" 2>&1 &
 pid=$!
 sleep 8
-kill -INT -- "-$pid"
+kill -INT -- "-$pid" 2>/dev/null || echo "    (resume had already exited before the signal)"
 set +e; wait "$pid"; RC=$?; set -e
 sed 's/^/    | /' "$OUT/sigint.log"; printf '    (exit %s)\n' "$RC"
 expect_rc 130 "interrupted resume exits 130"
