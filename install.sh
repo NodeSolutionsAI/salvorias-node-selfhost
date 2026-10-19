@@ -14,6 +14,10 @@
 #   - It never prints the node's private key.
 #   - It never sends a transaction. Every chain call is a read.
 #   - One node per server. A second install is refused.
+#   - Root never follows a link it does not own. The data directory is
+#     root:salvorias 0750, so the service account cannot add or swap entries
+#     there, and every file root touches in it must be a regular, unlinked
+#     file. Every download and RPC request is pinned to https, redirects too.
 #
 # Usage: see usage() below, or run with --help.
 # The marker on line 2 lets the self-copy step recognise a genuine copy.
@@ -32,6 +36,7 @@ SALVORIAS_RELEASE_BASE_URL="${SALVORIAS_RELEASE_BASE_URL:-}"
 SALVORIAS_WAIT_MINUTES="${SALVORIAS_WAIT_MINUTES:-30}"
 SALVORIAS_POLL_SECONDS="${SALVORIAS_POLL_SECONDS:-15}"
 SALVORIAS_UPGRADE_WATCH_SECONDS="${SALVORIAS_UPGRADE_WATCH_SECONDS:-30}"
+MIN_UPGRADE_WATCH_SECONDS=10
 
 # ─── Fixed layout ──────────────────────────────────────────────────────────
 # Not overridable: the systemd unit, node.env and the docs all name these.
@@ -40,6 +45,8 @@ SERVICE_USER="salvorias"
 OPT_DIR="/opt/salvorias"
 BIN_ROOT="$OPT_DIR/bin"
 CURRENT_LINK="$BIN_ROOT/current"
+# Names the version kept for `upgrade --rollback`; set by each upgrade.
+PREVIOUS_LINK="$BIN_ROOT/previous"
 PATH_LINK="/usr/local/bin/salvorias-node"
 ETC_DIR="/etc/salvorias"
 ENV_FILE="$ETC_DIR/node.env"
@@ -84,14 +91,15 @@ Needs root (sudo), Linux with systemd. Tested on Ubuntu 22.04+ and Debian 12+.
 
 USAGE
   sudo bash install.sh [command] [options]
-  curl -fsSL <install.sh url> | sudo bash -s -- [command] [options]
+  curl --proto '=https' --proto-redir '=https' -fsSL <install.sh url> | sudo bash -s -- [command] [options]
   sudo salvorias-selfhost <command> [options]     (after install)
 
 COMMANDS
   install          Set up the node (default command)
   resume           Continue an install that was waiting for registration
   status           Service state, version, slot binding, balance, recent logs
-  upgrade          Install a newer node binary; rolls back if it fails to run
+  upgrade          Install a newer node binary; rolls back if it fails to run.
+                   Also restarts a stopped service and repairs file ownership
   backup-key       Copy the node key to a root-only file for offline storage
   uninstall        Remove the service, binary and config (keeps the key)
 
@@ -113,6 +121,7 @@ INSTALL OPTIONS
 OTHER OPTIONS
   resume     [--wait-minutes N]
   upgrade    [--version vX] [--binary PATH] [--self PATH]
+  upgrade    --rollback            Switch back to the previous kept version
   backup-key [--out PATH]          (default: /root/salvorias-node-key-backup-<time>.txt)
   uninstall  [--yes] [--purge-key] (--purge-key also deletes the node key, after
                                     a typed confirmation)
@@ -123,6 +132,8 @@ ENVIRONMENT
   SALVORIAS_RELEASE_BASE_URL   Base URL holding the release assets and checksums.txt
   SALVORIAS_WAIT_MINUTES       Default for --wait-minutes
   SALVORIAS_POLL_SECONDS       Registration poll interval (default 15)
+  SALVORIAS_UPGRADE_WATCH_SECONDS  How long upgrade watches the new version
+                               before keeping it (default 30, minimum 10)
 
 EXIT CODES
   0 ok   1 error   2 bad usage or input   3 stopped: something to do outside
@@ -163,14 +174,32 @@ is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
 lower() { printf '%s' "${1,,}"; }
 
 # Plain http is only accepted for a local endpoint (a test mock or a local
-# node). Anything leaving the machine must be https.
+# node). Anything leaving the machine must be https. URLs are also written to
+# node.env and selfhost.conf, so they are held to a plain character set: no
+# userinfo (user@host), spaces, quotes, %, $ or backslashes.
+URL_PORT_RE='(:[0-9]{1,5})?'
+URL_PATH_RE='(/[A-Za-z0-9._~/-]*)?([?][A-Za-z0-9._~=&-]*)?'
+LOCAL_HTTP_RE="^http://(127[.]0[.]0[.]1|localhost)${URL_PORT_RE}${URL_PATH_RE}\$"
+HTTPS_URL_RE="^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?${URL_PORT_RE}${URL_PATH_RE}\$"
+is_local_http_url() { [[ "$1" =~ $LOCAL_HTTP_RE ]]; }
+is_safe_url() { [[ "$1" =~ $HTTPS_URL_RE ]] || is_local_http_url "$1"; }
 require_safe_url() {
-  case "$1" in
-    https://*) ;;
-    http://127.0.0.1:*|http://127.0.0.1/*|http://localhost:*|http://localhost/*) ;;
-    *) usage_error "$2 must be an https:// URL (plain http is only allowed for localhost): $1" ;;
-  esac
-  [[ "$1" != *[[:space:]]* ]] || usage_error "$2 contains whitespace: $1"
+  is_safe_url "$1" || usage_error "$2 must be an https:// URL with a plain host name and path (plain http is only allowed for http://127.0.0.1 or http://localhost): $1"
+}
+
+# GitHub owner/name, used in download URLs and in the unit file.
+REPO_RE='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+is_safe_repo() { [[ "$1" =~ $REPO_RE ]]; }
+
+# Last check before a value is written to node.env, selfhost.conf or the unit
+# file. Every value is validated where it comes from; this makes sure that a
+# newline, quote, %, $ or backslash can never reach those files regardless.
+PLAIN_VALUE_RE='^[A-Za-z0-9._:/?=&~-]+$'
+assert_plain_values() {
+  local v
+  for v in "$@"; do
+    [[ "$v" =~ $PLAIN_VALUE_RE ]] || die "Refusing to write an unexpected value into the service configuration: '${v:0:80}'."
+  done
 }
 
 # Wei amounts can exceed 64-bit shell arithmetic, so they are handled as
@@ -221,13 +250,57 @@ checkins_left() {
   awk -v b="$1" -v c="$2" 'BEGIN { if (c > 0) printf "%d", b / c; else printf "unlimited at the current fee of 0" }'
 }
 
+# ─── Release file checks ───────────────────────────────────────────────────
+
+# checksum_for ASSET FILE: prints the sha256 that checksums.txt lists for
+# ASSET, in lower case. Accepts sha256sum's text ("hash  name") and binary
+# ("hash *name") lines, and CRLF line endings. Fails when there is no entry
+# or when two entries for ASSET disagree.
+checksum_for() {
+  local found
+  found=$(awk -v f="$1" '{ sub(/\r$/, "") } NF == 2 && ($2 == f || $2 == "*" f) { print tolower($1) }' "$2" | sort -u)
+  [[ "$found" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s' "$found"
+}
+
+# check_elf FILE: true when FILE starts with the header of a 64-bit
+# little-endian ELF executable for this server's CPU (ASSET_ARCH). Runs
+# before any node binary is executed. Sets ELF_PROBLEM when it fails.
+ELF_PROBLEM=""
+check_elf() {
+  local hdr want
+  hdr=$(head -c 20 -- "$1" 2>/dev/null | od -An -v -tx1 | tr -d ' \n')
+  case "$ASSET_ARCH" in
+    linux-x64) want="3e00" ;;     # e_machine EM_X86_64, little-endian
+    linux-arm64) want="b700" ;;   # e_machine EM_AARCH64
+    *) want="" ;;
+  esac
+  if [[ "${hdr:0:8}" != "7f454c46" ]]; then
+    ELF_PROBLEM="it is not a Linux executable (no ELF header)"
+  elif [[ "${hdr:8:4}" != "0201" ]]; then
+    ELF_PROBLEM="it is not a 64-bit little-endian executable"
+  elif [[ "${hdr:36:4}" != "$want" ]]; then
+    ELF_PROBLEM="it is built for another CPU (ELF machine 0x${hdr:38:2}${hdr:36:2}), not $ASSET_ARCH"
+  else
+    ELF_PROBLEM=""
+    return 0
+  fi
+  return 1
+}
+
 # ─── Invocation hints ──────────────────────────────────────────────────────
 
 RUNNING_FILE=""
 
+# Set only when bash is running this installer from a file (sudo bash
+# install.sh, or the installed salvorias-selfhost). For a piped run (curl |
+# sudo bash) bash reports a pseudo source name such as "main", and a file of
+# that name in the current directory must never be taken for this script. The
+# bottom of the BASH_SOURCE stack equals $0 only for a script file.
 detect_running_file() {
-  local src="${BASH_SOURCE[0]:-}"
-  if [[ -n "$src" && -f "$src" ]]; then
+  local n="${#BASH_SOURCE[@]}" src=""
+  if (( n > 0 )); then src="${BASH_SOURCE[n-1]}"; fi
+  if [[ -n "$src" && "$src" == "$0" && -f "$src" ]]; then
     RUNNING_FILE="$(cd "$(dirname "$src")" && pwd)/$(basename "$src")"
   fi
 }
@@ -239,28 +312,74 @@ cmd_hint() {
   elif [[ -n "$RUNNING_FILE" ]]; then
     printf 'sudo bash %s %s' "$RUNNING_FILE" "$1"
   else
-    printf 'curl -fsSL https://github.com/%s/releases/latest/download/install.sh | sudo bash -s -- %s' "$SALVORIAS_RELEASE_REPO" "$1"
+    printf "curl --proto '=https' --proto-redir '=https' -fsSL https://github.com/%s/releases/latest/download/install.sh | sudo bash -s -- %s" "$SALVORIAS_RELEASE_REPO" "$1"
   fi
 }
 
 # ─── Cleanup and signals ───────────────────────────────────────────────────
 
 TMP_DIR=""
+DATA_STAGE=""
 INTERRUPT_HINT=""
+# Set while an upgrade (or rollback) is being watched: the version to switch
+# back to if the run is interrupted, and the directory that run placed.
+UPGRADE_ROLLBACK_TO=""
+UPGRADE_PLACED=""
+UPGRADE_PLACED_NEW=0
 
+# Staged key copies are shredded, not just unlinked.
 cleanup() {
-  if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then rm -rf "$TMP_DIR"; fi
+  local d
+  for d in "$TMP_DIR" "$DATA_STAGE"; do
+    if [[ -n "$d" && -d "$d" && ! -L "$d" ]]; then
+      find "$d" -type f \( -name 'key-*' -o -name 'node-key.txt' \) -exec shred -u {} + 2>/dev/null || true
+      rm -rf "$d"
+    fi
+  done
 }
 
 on_signal() {
+  trap '' INT TERM HUP
   printf '\n\nInterrupted.\n' >&2
+  if [[ -n "$UPGRADE_ROLLBACK_TO" ]]; then
+    printf 'Switching back to %s ...\n' "$UPGRADE_ROLLBACK_TO" >&2
+    undo_upgrade
+    if service_stays_up 6; then
+      printf 'Switched back to %s, which is running.\n' "$(current_version_name)" >&2
+    else
+      printf 'Switched back to %s, but the service is not staying up. Check: %s\n' "$(current_version_name)" "$(cmd_hint status)" >&2
+    fi
+  fi
   if [[ -n "$INTERRUPT_HINT" ]]; then printf '%s\n' "$INTERRUPT_HINT" >&2; fi
   exit 130
 }
 
+# A fresh root-owned 0700 directory (mktemp -d) for downloads and key copies.
 make_tmp_dir() {
   if [[ -z "$TMP_DIR" ]]; then
     TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/salvorias-install.XXXXXX")
+  fi
+}
+
+# Root-only staging directory inside DATA_DIR, for files that are then
+# renamed into place there (a rename stays on one file system and never
+# follows a link at the destination). DATA_DIR must already be secured.
+make_data_stage() {
+  if [[ -z "$DATA_STAGE" ]]; then
+    DATA_STAGE=$(mktemp -d "$DATA_DIR/.stage.XXXXXX")
+  fi
+}
+
+# Every request is pinned to https, after redirects too (GitHub release URLs
+# redirect to a CDN), so a redirect can never downgrade to plain http. The
+# one exception, an explicit local http URL, may not redirect at all.
+# The URL must be the last argument.
+curl_safe() {
+  local url="${*: -1}"
+  if is_local_http_url "$url"; then
+    curl --proto '=http' --max-redirs 0 "$@"
+  else
+    curl --proto '=https' --proto-redir '=https' "$@"
   fi
 }
 
@@ -315,7 +434,7 @@ ensure_tools() {
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates </dev/null >/dev/null
   fi
   local tool
-  for tool in curl sha256sum systemctl journalctl useradd install awk sed grep mktemp timeout; do
+  for tool in curl sha256sum systemctl journalctl useradd getent install awk sed grep mktemp timeout od head find stat dd shred cmp; do
     command -v "$tool" >/dev/null 2>&1 || die "Required command '$tool' was not found. Install it, then rerun."
   done
 }
@@ -325,7 +444,7 @@ ensure_tools() {
 check_rpc() {
   local body hex rc=0
   require_safe_url "$RPC_URL" "--rpc-url"
-  body=$(curl -fsS --max-time 20 -H 'Content-Type: application/json' \
+  body=$(curl_safe -fsS --max-time 20 -H 'Content-Type: application/json' \
     --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' "$RPC_URL" 2>&1) || rc=$?
   if (( rc == 22 )); then
     # Reached the server, which answered with an HTTP error: not a firewall issue.
@@ -362,7 +481,7 @@ fetch_checksums() {
   base=$(release_base_url)
   require_safe_url "$base" "SALVORIAS_RELEASE_BASE_URL"
   make_tmp_dir
-  if ! curl -fsSL --retry 3 --max-time 60 -o "$TMP_DIR/checksums.txt" "$base/checksums.txt"; then
+  if ! curl_safe -fsSL --retry 3 --max-time 60 -o "$TMP_DIR/checksums.txt" "$base/checksums.txt"; then
     die "Could not download $base/checksums.txt. Check the release exists (--version) and that this server can reach it."
   fi
   CHECKSUMS_FILE="$TMP_DIR/checksums.txt"
@@ -374,15 +493,15 @@ download_verified() {
   local asset="$1" dest="$2" base expected actual
   fetch_checksums
   base=$(release_base_url)
-  expected=$(awk -v f="$asset" '$2 == f || $2 == "*" f { print $1; exit }' "$CHECKSUMS_FILE")
-  [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || die "checksums.txt at $base has no entry for $asset. Refusing to install an unverified file."
+  expected=$(checksum_for "$asset" "$CHECKSUMS_FILE") \
+    || die "checksums.txt at $base has no single valid entry for $asset. Refusing to install an unverified file."
   say "Downloading $asset ..."
-  if ! curl -fsSL --retry 3 --max-time 300 -o "$dest" "$base/$asset"; then
+  if ! curl_safe -fsSL --retry 3 --max-time 300 -o "$dest" "$base/$asset"; then
     rm -f "$dest"
     die "Could not download $base/$asset."
   fi
   actual=$(sha256sum "$dest" | awk '{ print $1 }')
-  if [[ "$(lower "$expected")" != "$(lower "$actual")" ]]; then
+  if [[ "$expected" != "$(lower "$actual")" ]]; then
     rm -f "$dest"
     die "Checksum mismatch for $asset (expected $expected, got $actual). The download is corrupt or has been tampered with. Nothing was installed from it."
   fi
@@ -407,6 +526,7 @@ stage_binary() {
     download_verified "salvorias-node-$ASSET_ARCH" "$STAGED_BIN"
     chmod 0755 "$STAGED_BIN"
   fi
+  check_elf "$STAGED_BIN" || die "The node binary cannot be used on this server: $ELF_PROBLEM. Nothing was changed."
 
   local out rc=0
   out=$("$STAGED_BIN" version </dev/null 2>&1) || rc=$?
@@ -430,6 +550,7 @@ place_binary() {
   local sha name
   sha=$(file_sha "$STAGED_BIN")
   name="$STAGED_VERSION"
+  case "$name" in current|previous) die "The node binary reports the version '$name', which is reserved here." ;; esac
   if [[ -e "$BIN_ROOT/$name/salvorias-node" && "$(file_sha "$BIN_ROOT/$name/salvorias-node")" != "$sha" ]]; then
     name="$STAGED_VERSION-${sha:0:12}"
   fi
@@ -452,6 +573,27 @@ switch_current() {
 
 current_version_name() {
   readlink "$CURRENT_LINK" 2>/dev/null || true
+}
+
+set_previous_link() {
+  [[ -n "$1" ]] || return 0
+  ln -sfn "$1" "$BIN_ROOT/.previous.new"
+  mv -Tf "$BIN_ROOT/.previous.new" "$PREVIOUS_LINK"
+}
+
+# The version `upgrade --rollback` switches to. Installs from before the
+# previous link existed keep exactly one other version directory; use it.
+previous_version_name() {
+  local p dir cur others=()
+  p=$(readlink "$PREVIOUS_LINK" 2>/dev/null || true)
+  if [[ -z "$p" ]]; then
+    cur=$(current_version_name)
+    for dir in "$BIN_ROOT"/*; do
+      [[ -d "$dir" && ! -L "$dir" && "$(basename "$dir")" != "$cur" ]] && others+=("$(basename "$dir")")
+    done
+    if (( ${#others[@]} == 1 )); then p="${others[0]}"; fi
+  fi
+  printf '%s' "$p"
 }
 
 # ─── Installer self-copy ───────────────────────────────────────────────────
@@ -617,6 +759,7 @@ ST_STAGE=""
 
 write_state() {
   local tmp
+  assert_plain_values "$1" "$NETWORK" "$RPC_URL" "$NET_CHAIN_ID" "$NET_CHECKIN" "$NET_NFT" "$NET_TREASURY" "$OWNER" "$NODE_ADDRESS"
   tmp=$(mktemp "$ETC_DIR/.selfhost.conf.XXXXXX")
   cat >"$tmp" <<EOF
 # Written by the Salvorias self-host installer. The node daemon does not read
@@ -666,6 +809,7 @@ load_state() {
   is_address "$nft" && NET_NFT="$nft"
   is_address "$treasury" && NET_TREASURY="$treasury"
   RPC_URL="${rpc:-$NET_RPC_URL}"
+  is_safe_url "$RPC_URL" || die "$STATE_FILE has an RPC_URL that is not a plain https (or local http) URL."
   is_address "$owner" || die "$STATE_FILE has no valid OWNER_ADDRESS."
   is_address "$node" || die "$STATE_FILE has no valid NODE_ADDRESS."
   OWNER="$owner"
@@ -675,8 +819,8 @@ load_state() {
 # ─── One node per server ───────────────────────────────────────────────────
 
 guard_single_node() {
-  if [[ -f "$STATE_FILE" ]] && grep -q '^STAGE=awaiting-registration$' "$STATE_FILE"; then
-    printf 'ERROR: An install on this server is already waiting for the node to be registered.\n' >&2
+  if [[ -f "$STATE_FILE" ]] && grep -qE '^STAGE=(awaiting-registration|starting)$' "$STATE_FILE"; then
+    printf 'ERROR: An install on this server has not finished (it is waiting for the node to be registered, or for the service to start).\n' >&2
     printf '  Continue it:   %s\n' "$(cmd_hint resume)" >&2
     printf '  Start over:    %s   (then install again)\n' "$(cmd_hint uninstall)" >&2
     exit "$EXIT_ERROR"
@@ -692,6 +836,42 @@ guard_single_node() {
 
 # ─── System user and directories ───────────────────────────────────────────
 
+# The service runs as salvorias, which can read the node key. An account of
+# that name that this installer did not create could be a login account, or
+# share its group with people, so an existing one is used only if it looks
+# exactly like the account `useradd --system` makes below. Read-only.
+check_existing_user() {
+  local entry group_entry uid_min shell problems=()
+  local -a pw gr
+  entry=$(getent passwd "$SERVICE_USER") || return 0
+  IFS=: read -r -a pw <<<"$entry"
+  uid_min=$(awk '$1 == "UID_MIN" { print $2; exit }' /etc/login.defs 2>/dev/null || true)
+  is_uint "$uid_min" || uid_min=1000
+  if ! is_uint "${pw[2]:-}" || (( pw[2] == 0 || pw[2] >= uid_min )); then
+    problems+=("UID ${pw[2]:-?} is not a system UID (1 to $((uid_min - 1)))")
+  fi
+  if group_entry=$(getent group "$SERVICE_USER"); then
+    IFS=: read -r -a gr <<<"$group_entry"
+    [[ "${gr[2]:-}" == "${pw[3]:-}" ]] || problems+=("its primary group is not '$SERVICE_USER'")
+    [[ -z "${gr[3]:-}" ]] || problems+=("the '$SERVICE_USER' group has other members (${gr[3]})")
+  else
+    problems+=("there is no group named '$SERVICE_USER'")
+  fi
+  shell="${pw[6]:-}"
+  case "$shell" in
+    /usr/sbin/nologin|/sbin/nologin|/bin/false|/usr/bin/false) ;;
+    *) problems+=("its shell '$shell' allows logins") ;;
+  esac
+  if [[ "${pw[5]:-}" != "/nonexistent" && -e "${pw[5]:-}" ]]; then
+    problems+=("it has a real home directory (${pw[5]})")
+  fi
+  if (( ${#problems[@]} > 0 )); then
+    local joined
+    joined=$(printf '%s; ' "${problems[@]}")
+    die "An account named '$SERVICE_USER' already exists, but it is not a locked-down system account: ${joined%; }. Refusing to run the node service as it. If this installer did not create it, rename or remove it, then rerun."
+  fi
+}
+
 ensure_user() {
   if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
     local nologin
@@ -704,10 +884,54 @@ ensure_user() {
 make_dirs() {
   install -d -m 0755 -o root -g root "$OPT_DIR" "$BIN_ROOT"
   install -d -m 0750 -o root -g "$SERVICE_USER" "$ETC_DIR"
-  install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DATA_DIR"
-  # install -d does not always reset an existing directory, so pin it.
-  chown "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"
-  chmod 0700 "$DATA_DIR"
+  if [[ ! -e "$DATA_DIR" && ! -L "$DATA_DIR" ]]; then
+    install -d -m 0750 -o root -g "$SERVICE_USER" "$DATA_DIR"
+  fi
+  secure_data_dir
+}
+
+# DATA_DIR is root:salvorias 0750: the service can read its key but cannot
+# create, rename or replace anything in the directory, so a link planted by
+# a compromised service can never redirect root's later chown, write, read or
+# shred. Installs from before this layout had it salvorias-owned 0700; this
+# migrates them. The directory is locked FIRST and inspected second: in that
+# order nothing can be planted between the check and the use. Locking an
+# existing directory is safe because it is checked to be a real directory in
+# root-owned /var/lib, where the service cannot swap it.
+secure_data_dir() {
+  if [[ ! -e "$DATA_DIR" && ! -L "$DATA_DIR" ]]; then return 0; fi
+  [[ -d "$DATA_DIR" && ! -L "$DATA_DIR" ]] \
+    || die "$DATA_DIR is not a plain directory (it may be a symbolic link). Refusing to use it. Inspect it, and remove it if it is not yours."
+  getent group "$SERVICE_USER" >/dev/null \
+    || die "$DATA_DIR exists but the '$SERVICE_USER' group does not. Refusing to guess who should own it. Inspect it, move the key somewhere safe if it is yours, then rerun."
+  chown -h "root:$SERVICE_USER" "$DATA_DIR"
+  chmod 0750 "$DATA_DIR"
+  local odd
+  odd=$(find "$DATA_DIR" -mindepth 1 -maxdepth 1 \( -type l -o \( ! -type f ! -type d \) \) -printf '%f ' 2>/dev/null)
+  if [[ -n "$odd" ]]; then
+    die "$DATA_DIR contains a symbolic link or special file (${odd% }). It may have been planted by a compromised node service. Refusing to touch anything in it. Inspect it (do not follow the link), remove it, then rerun."
+  fi
+  local f
+  for f in "$KEY_FILE" "$ADDRESS_FILE"; do
+    if [[ -e "$f" || -L "$f" ]]; then require_data_file "$f"; fi
+  done
+}
+
+# Every root operation on a file in DATA_DIR (chown, chmod, read, write,
+# compare, copy, shred) is preceded by this check.
+require_data_file() {
+  if [[ -L "$1" || ! -f "$1" ]]; then
+    die "$1 is not a regular file (it may be a symbolic link). Refusing to touch it or follow it. Inspect it, and remove it if it is not yours."
+  fi
+  [[ "$(stat -c '%h' -- "$1")" == 1 ]] || die "$1 has other hard links. Refusing to touch it. Inspect it, then rerun."
+}
+
+# place_data_file STAGED DEST OWNER MODE: sets the owner and mode on a file in
+# the root-only staging directory, then renames it to DEST.
+place_data_file() {
+  chown -h "$3" "$1"
+  chmod "$4" "$1"
+  mv -fT -- "$1" "$2"
 }
 
 # ─── Node key ──────────────────────────────────────────────────────────────
@@ -715,78 +939,109 @@ make_dirs() {
 NODE_ADDRESS=""
 KEY_SOURCE=""   # generated, imported, reused
 
-# derive_address BIN KEYFILE: sets DERIVED_ADDRESS to the key's address.
-# The binary has no single-purpose "address of this key file" command, so this
-# uses `list`, which derives each address locally and makes only read calls.
-# `list` never prints keys (a bad row prints "(invalid key)"), and it reads the
-# file named by KEYS_FILE (its --keys-file flag sets a different variable).
+# derive_address BIN KEYFILE: sets DERIVED_ADDRESS to the address of the one
+# key in KEYFILE. `salvorias-node key-address` makes no RPC call, never prints
+# the key, and exits 2 for a group/world-accessible file, zero keys or more
+# than one.
 DERIVED_ADDRESS=""
 derive_address() {
   local out
   DERIVED_ADDRESS=""
-  out=$(KEYS_FILE="$2" RPC_URL="$RPC_URL" CHECKIN_CONTRACT="$NET_CHECKIN" NFT_CONTRACT="$NET_NFT" \
-    TREASURY_CONTRACT="$NET_TREASURY" timeout 120 "$1" list </dev/null 2>/dev/null) || return 1
-  DERIVED_ADDRESS=$(printf '%s\n' "$out" | grep -E '^ *1 +0x[0-9a-fA-F]{40}' | grep -oE '0x[0-9a-fA-F]{40}' | head -n 1 || true)
-  is_address "$DERIVED_ADDRESS"
+  out=$(timeout 60 "$1" key-address --keys-file "$2" </dev/null 2>/dev/null) || return 1
+  is_address "$out" || return 1
+  DERIVED_ADDRESS="$out"
 }
 
-# Checks an --import-key file without ever printing its contents.
-validate_import_file() {
+same_address() { [[ "$(lower "$1")" == "$(lower "$2")" ]]; }
+
+KEY_FORMAT_MSG="--import-key file must contain exactly one node key (64 hex characters, optional 0x, optional trailing newline). Nothing else is allowed."
+
+# Reads the --import-key file exactly ONCE, into a root-only staging copy in
+# the fresh 0700 temp dir, and does every later step (validation, address,
+# install) from that copy, so the source cannot be swapped between the check
+# and the use. dd's iflag=nofollow refuses a link even if one replaces the
+# file after the -L test. The contents are never printed.
+IMPORT_STAGED=""
+stage_import_key() {
   local f="$1" mode size line
+  [[ ! -L "$f" ]] || usage_error "--import-key $f is a symbolic link. Pass the key file itself."
   [[ -f "$f" ]] || usage_error "--import-key file not found (or not a regular file): $f"
   [[ "$(cd "$(dirname "$f")" && pwd)/$(basename "$f")" != "$KEY_FILE" ]] || usage_error "--import-key cannot be the installed key file itself."
-  mode=$(stat -L -c '%a' "$f")
+  mode=$(stat -c '%a' -- "$f")
   if (( (8#$mode & 8#044) != 0 )); then
     usage_error "--import-key file $f is readable by other users (mode $mode). A node key must be private: run 'sudo chmod 600 $f' and try again."
   fi
-  size=$(stat -L -c '%s' "$f")
-  (( size >= 64 && size <= 67 )) || usage_error "--import-key file must contain exactly one node key (64 hex characters, optional 0x, optional trailing newline). Nothing else is allowed."
+  make_tmp_dir
+  IMPORT_STAGED="$TMP_DIR/key-import"
+  ( umask 077; timeout 10 dd if="$f" of="$IMPORT_STAGED" iflag=nofollow bs=4096 count=1 status=none ) \
+    || usage_error "Could not read the --import-key file $f (it must be a regular file, not a link)."
+  size=$(stat -c '%s' -- "$IMPORT_STAGED")
+  (( size >= 64 && size <= 67 )) || usage_error "$KEY_FORMAT_MSG"
   line=""
-  IFS= read -r line <"$f" || true
+  IFS= read -r line <"$IMPORT_STAGED" || true
   # Exactly one key: the line plus at most one newline accounts for every byte.
   if [[ ! "$line" =~ ^(0x)?[0-9a-fA-F]{64}$ ]] || (( size != ${#line} && size != ${#line} + 1 )); then
     line=""
-    usage_error "--import-key file must contain exactly one node key (64 hex characters, optional 0x, optional trailing newline). Nothing else is allowed."
+    usage_error "$KEY_FORMAT_MSG"
   fi
   line=""
+  derive_address "$STAGED_BIN" "$IMPORT_STAGED" \
+    || die "Could not read a node address from the --import-key file. The node binary must support 'key-address' (salvorias-node 0.0.9 or later)."
 }
 
-# Writes the imported key, normalised to one 0x-prefixed line, as the
-# salvorias user's 0600 key file. noclobber makes the write fail rather than
-# replace a file that appeared in the meantime.
+# Installs the staged import, normalised to one 0x-prefixed lower-case line
+# (the keygen format), as the salvorias user's 0600 key file.
 install_imported_key() {
-  local line
-  IFS= read -r line <"$1" || true
+  local line staged
+  [[ ! -e "$KEY_FILE" && ! -L "$KEY_FILE" ]] || die "$KEY_FILE appeared during the install. Refusing to replace it."
+  make_data_stage
+  staged="$DATA_STAGE/node-key.txt"
+  IFS= read -r line <"$IMPORT_STAGED" || true
   line="${line#0x}"
-  ( umask 077; set -o noclobber; printf '0x%s\n' "${line,,}" >"$KEY_FILE" ) || { line=""; die "Could not write $KEY_FILE."; }
+  ( umask 077; set -o noclobber; printf '0x%s\n' "${line,,}" >"$staged" ) || { line=""; die "Could not stage the node key."; }
   line=""
-  chown "$SERVICE_USER:$SERVICE_USER" "$KEY_FILE"
-  chmod 0600 "$KEY_FILE"
+  if ! { derive_address "$PATH_LINK" "$staged" && same_address "$DERIVED_ADDRESS" "$NODE_ADDRESS"; }; then
+    die "The normalised key does not match the imported one. Nothing was installed."
+  fi
+  place_data_file "$staged" "$KEY_FILE" "$SERVICE_USER:$SERVICE_USER" 0600
 }
 
+# The address record is root's (root:root 0644): the service never needs to
+# change it, and status and uninstall read it.
 write_address_file() {
-  printf '%s\n' "$NODE_ADDRESS" >"$ADDRESS_FILE"
-  chown "$SERVICE_USER:$SERVICE_USER" "$ADDRESS_FILE"
-  chmod 0644 "$ADDRESS_FILE"
+  if [[ -e "$ADDRESS_FILE" || -L "$ADDRESS_FILE" ]]; then require_data_file "$ADDRESS_FILE"; fi
+  make_data_stage
+  printf '%s\n' "$NODE_ADDRESS" >"$DATA_STAGE/node-address.txt"
+  place_data_file "$DATA_STAGE/node-address.txt" "$ADDRESS_FILE" root:root 0644
 }
 
 # Works out which key this install will use, and its address, before anything
 # is installed: an imported key, a key kept by an earlier uninstall, or (if
 # neither) a key generated later by ensure_node_key.
+# A kept key's address is derived from the key itself; the address record
+# is rewritten from it later.
 plan_node_key() {
+  local kept=""
+  secure_data_dir
+  if [[ -e "$KEY_FILE" ]]; then
+    derive_address "$STAGED_BIN" "$KEY_FILE" \
+      || die "A node key exists at $KEY_FILE but could not be read as exactly one node key (the node binary must support 'key-address', salvorias-node 0.0.9 or later). Move it somewhere safe, then rerun."
+    kept="$DERIVED_ADDRESS"
+  fi
   if [[ -n "$OPT_IMPORT_KEY" ]]; then
-    validate_import_file "$OPT_IMPORT_KEY"
-    if [[ -e "$KEY_FILE" ]] && ! cmp -s "$OPT_IMPORT_KEY" "$KEY_FILE"; then
-      die "A different node key already exists at $KEY_FILE (kept by an earlier uninstall). Back it up with care, then remove it with '$(cmd_hint 'uninstall --purge-key')' before importing another key."
-    fi
-    derive_address "$STAGED_BIN" "$OPT_IMPORT_KEY" || die "Could not read the node address from the --import-key file. Check the file and the RPC, then try again."
+    stage_import_key "$OPT_IMPORT_KEY"
     NODE_ADDRESS="$DERIVED_ADDRESS"
-    KEY_SOURCE="imported"
+    if [[ -n "$kept" ]] && ! same_address "$kept" "$NODE_ADDRESS"; then
+      die "A different node key ($kept) already exists at $KEY_FILE (kept by an earlier uninstall). Back it up with care, then remove it with '$(cmd_hint 'uninstall --purge-key')' before importing another key."
+    fi
     say "Imported key belongs to node $NODE_ADDRESS"
-  elif [[ -e "$KEY_FILE" ]]; then
-    local kept=""
-    if [[ -f "$ADDRESS_FILE" ]]; then kept=$(head -n 1 "$ADDRESS_FILE"); fi
-    is_address "$kept" || die "A node key exists at $KEY_FILE but its address record ($ADDRESS_FILE) is missing. Move the key somewhere safe (or use --import-key with it), then rerun."
+    if [[ -n "$kept" ]]; then
+      KEY_SOURCE="reused"
+      say "That is the same key as the one kept at $KEY_FILE; keeping that file."
+    else
+      KEY_SOURCE="imported"
+    fi
+  elif [[ -n "$kept" ]]; then
     NODE_ADDRESS="$kept"
     KEY_SOURCE="reused"
     say "Found the node key kept by an earlier uninstall: $NODE_ADDRESS (reusing it)"
@@ -798,24 +1053,31 @@ plan_node_key() {
 ensure_node_key() {
   case "$KEY_SOURCE" in
     generated)
-      local addr rc=0
-      addr=$("$PATH_LINK" keygen --out "$KEY_FILE" </dev/null) || rc=$?
+      local addr rc=0 staged
+      [[ ! -e "$KEY_FILE" && ! -L "$KEY_FILE" ]] || die "$KEY_FILE appeared during the install. Refusing to replace it."
+      make_data_stage
+      staged="$DATA_STAGE/node-key.txt"
+      addr=$("$PATH_LINK" keygen --out "$staged" </dev/null) || rc=$?
       (( rc == 0 )) || die "Node key generation failed (exit $rc)."
-      chown "$SERVICE_USER:$SERVICE_USER" "$KEY_FILE"
-      chmod 0600 "$KEY_FILE"
       is_address "$addr" || die "keygen returned an unexpected address."
+      if ! { derive_address "$PATH_LINK" "$staged" && same_address "$DERIVED_ADDRESS" "$addr"; }; then
+        die "The generated key does not match the address keygen reported. Nothing was installed."
+      fi
+      place_data_file "$staged" "$KEY_FILE" "$SERVICE_USER:$SERVICE_USER" 0600
       NODE_ADDRESS="$addr"
       write_address_file
       say "Generated a new node key on this server: $KEY_FILE"
       ;;
     imported)
-      if [[ ! -e "$KEY_FILE" ]]; then install_imported_key "$OPT_IMPORT_KEY"; fi
+      install_imported_key
       write_address_file
       say "Installed the imported node key: $KEY_FILE"
       ;;
     reused)
-      chown "$SERVICE_USER:$SERVICE_USER" "$KEY_FILE"
+      require_data_file "$KEY_FILE"
+      chown -h "$SERVICE_USER:$SERVICE_USER" "$KEY_FILE"
       chmod 0600 "$KEY_FILE"
+      write_address_file
       ;;
   esac
 }
@@ -851,16 +1113,23 @@ print_funding() {
   is_uint "$gas_limit" || gas_limit=100000
   cap_cost=$(( gas_limit * MAX_GAS_PRICE_GWEI * 1000000000 ))
 
+  # slot-info's estimate is gas limit x max fee per gas: the balance the chain
+  # requires before it accepts a check-in, not what it charges. The charge is
+  # gas used x the fee actually paid, which is lower, so these numbers are
+  # deliberately upper bounds.
   say "   Send SAVDR to the NODE address above (not to your license wallet)."
   say "   The node pays the network fee for each daily check-in."
   if [[ "$(strip_zeros "$cost")" == "0" ]]; then
     say "   The network fee is 0 right now, so check-ins cost nothing today."
-    say "   Fees can rise (this node pays at most $(wei_to_savdr "$cap_cost") SAVDR per check-in),"
-    say "   so keep some SAVDR on the node."
+    say "   Fees can rise: at the $MAX_GAS_PRICE_GWEI gwei cap the chain reserves up to"
+    say "   $(wei_to_savdr "$cap_cost") SAVDR per check-in, so keep some SAVDR on the node."
   else
-    say "   One check-in costs about $(wei_to_savdr "$cost") SAVDR at today's fee"
-    say "   (at most $(wei_to_savdr "$cap_cost") SAVDR at the $MAX_GAS_PRICE_GWEI gwei cap)."
-    say "   Suggested: at least $(wei_to_savdr "$(wei_times "$cost" "$DAYS_TO_FUND")") SAVDR for about $DAYS_TO_FUND days of daily check-ins."
+    say "   Keep at least $(wei_to_savdr "$cost") SAVDR on the node (the per-check-in reserve"
+    say "   at today's fee); actual fees are lower. At the $MAX_GAS_PRICE_GWEI gwei cap the"
+    say "   reserve is at most $(wei_to_savdr "$cap_cost") SAVDR."
+    say "   Suggested for about $DAYS_TO_FUND days: $(wei_to_savdr "$(wei_times "$cost" "$((DAYS_TO_FUND + 1))")") SAVDR. That is the reserve"
+    say "   plus $DAYS_TO_FUND check-ins charged at the full reserve; actual fees are lower,"
+    say "   so it should last longer than that at today's fee."
   fi
   say "   Current node balance: $(wei_to_savdr "$balance") SAVDR"
 }
@@ -930,6 +1199,7 @@ wait_for_binding() {
 
 write_env_file() {
   local tmp
+  assert_plain_values "$NET_CHECKIN" "$RPC_URL" "$NET_TREASURY" "$NET_CHAIN_ID" "$KEY_FILE" "$GAS_PRICE_MODE" "$MAX_GAS_PRICE_GWEI"
   tmp=$(mktemp "$ETC_DIR/.node.env.XXXXXX")
   cat >"$tmp" <<EOF
 # Salvorias node daemon settings, written by the self-host installer.
@@ -951,6 +1221,8 @@ EOF
 
 write_unit_file() {
   local tmp
+  is_safe_repo "$SALVORIAS_RELEASE_REPO" || die "SALVORIAS_RELEASE_REPO is not a GitHub owner/name."
+  assert_plain_values "$SERVICE_USER" "$ENV_FILE" "$PATH_LINK"
   tmp=$(mktemp "/etc/systemd/system/.salvorias-node.service.XXXXXX")
   cat >"$tmp" <<EOF
 # Installed by the Salvorias self-host installer.
@@ -961,7 +1233,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# exec: a binary that cannot be started fails the start itself.
+Type=exec
 User=$SERVICE_USER
 Group=$SERVICE_USER
 EnvironmentFile=$ENV_FILE
@@ -978,7 +1251,8 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=$DATA_DIR
+# No ReadWritePaths: the daemon writes no files (it logs to the journal), so
+# the whole file system stays read-only to it, its key directory included.
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -1019,6 +1293,7 @@ cmd_install() {
   check_platform
   ensure_tools
   guard_single_node
+  check_existing_user
 
   set_network "$OPT_NETWORK"
   RPC_URL="${OPT_RPC_URL:-$NET_RPC_URL}"
@@ -1107,8 +1382,20 @@ finalize_install() {
   banner "Starting the node service"
   write_env_file
   write_unit_file
+  # "starting" until systemd has actually started the service, so a failed
+  # start stays resumable instead of being recorded as installed.
+  write_state starting
   systemctl daemon-reload
-  systemctl enable --now "$UNIT_NAME" >/dev/null 2>&1 || true
+  # enable and start separately: `enable --now` exits 0 even when the start
+  # job fails (seen on systemd 255), while `start` waits for the job and
+  # reports its result.
+  local err=""
+  if ! err=$(systemctl enable "$UNIT_NAME" 2>&1 >/dev/null) || ! err=$(systemctl start "$UNIT_NAME" 2>&1 >/dev/null); then
+    say ""
+    say "Recent log:"
+    show_journal 20
+    die "The node service could not be started (${err:0:300}). The key and settings are saved, and systemd keeps retrying the service. Fix the problem shown above, then run: $(cmd_hint resume)"
+  fi
   write_state installed
 
   local healthy=1
@@ -1140,7 +1427,7 @@ finalize_install() {
   fi
   if is_uint "$balance" && is_uint "$cost" && wei_lt "$balance" "$cost"; then
     say ""
-    warn "The node balance is below the cost of one check-in ($(wei_to_savdr "$cost") SAVDR). It cannot check in until you send SAVDR to $NODE_ADDRESS."
+    warn "The node balance is below the per-check-in reserve ($(wei_to_savdr "$cost") SAVDR at today's fee). The chain will not accept a check-in until you send SAVDR to $NODE_ADDRESS."
   fi
   say ""
   say "Next:"
@@ -1169,11 +1456,15 @@ cmd_resume() {
   ensure_tools
   load_state
   if [[ "$ST_STAGE" == "installed" ]]; then
-    say "This node is already installed and running. Check it with: $(cmd_hint status)"
+    say "This node is already installed. Check it with: $(cmd_hint status)"
+    say "If the service is not running, restart and repair it with: $(cmd_hint upgrade)"
     return 0
   fi
-  [[ "$ST_STAGE" == "awaiting-registration" ]] || die "Unknown install stage '$ST_STAGE' in $STATE_FILE."
-  [[ -f "$KEY_FILE" ]] || die "The node key $KEY_FILE is missing, so this install cannot continue. Start over: $(cmd_hint uninstall), then install again."
+  [[ "$ST_STAGE" == "awaiting-registration" || "$ST_STAGE" == "starting" ]] || die "Unknown install stage '$ST_STAGE' in $STATE_FILE."
+  check_existing_user
+  secure_data_dir
+  [[ -e "$KEY_FILE" ]] || die "The node key $KEY_FILE is missing, so this install cannot continue. Start over: $(cmd_hint uninstall), then install again."
+  require_data_file "$KEY_FILE"
   [[ -x "$PATH_LINK" ]] || die "The node binary $PATH_LINK is missing. Start over: $(cmd_hint uninstall), then install again."
   if [[ ! -x "$SELF_PATH" || -n "$OPT_SELF" ]]; then install_self_copy; fi
 
@@ -1214,10 +1505,10 @@ cmd_status() {
     cost=$(json_str estimatedCheckInCostWei)
     if is_uint "$balance" && is_uint "$cost"; then
       say "  Balance:   $(wei_to_savdr "$balance") SAVDR"
-      say "  Per check-in: about $(wei_to_savdr "$cost") SAVDR at today's fee"
-      say "  Check-ins left: about $(checkins_left "$balance" "$cost")"
+      say "  Reserve per check-in: $(wei_to_savdr "$cost") SAVDR at today's fee (actual fees are lower)"
+      say "  Check-ins left: at least about $(checkins_left "$balance" "$cost")"
       if wei_lt "$balance" "$cost"; then
-        warn "Balance is below one check-in. Send SAVDR to $NODE_ADDRESS."
+        warn "Balance is below the per-check-in reserve. Send SAVDR to $NODE_ADDRESS."
       fi
     fi
   else
@@ -1238,28 +1529,57 @@ cmd_upgrade() {
   load_state
   [[ "$ST_STAGE" == "installed" ]] || die "The install has not finished (stage: $ST_STAGE). Finish it first: $(cmd_hint resume)"
   [[ -f "$UNIT_FILE" ]] || die "The service $UNIT_NAME is not installed."
+  check_existing_user
+  if (( OPT_ROLLBACK == 1 )); then
+    upgrade_rollback
+    return 0
+  fi
 
   banner "Upgrading the Salvorias node"
+  repair_layout
   stage_binary
   local previous
   previous=$(current_version_name)
   if [[ -n "$previous" && -f "$BIN_ROOT/$previous/salvorias-node" ]] \
       && [[ "$(file_sha "$STAGED_BIN")" == "$(file_sha "$BIN_ROOT/$previous/salvorias-node")" ]]; then
     install_self_copy
-    say "Already running this binary ($previous). Nothing to do."
-    return 0
+    if (( UNIT_CHANGED == 0 )) && systemctl is-active --quiet "$UNIT_NAME"; then
+      say "Already running this binary ($previous). Nothing to do."
+      return 0
+    fi
+    if (( UNIT_CHANGED == 1 )); then
+      say "Already on this binary ($previous). Restarting the service to apply the updated unit file..."
+    else
+      say "Already on this binary ($previous), but the service is not running. Restarting it..."
+    fi
+    systemctl restart "$UNIT_NAME" || true
+    if service_stays_up 10; then
+      say "The service is running on $previous."
+      return 0
+    fi
+    say ""
+    say "Recent log:"
+    show_journal 15
+    die "The service does not stay up on $previous. Read the log above, then check: $(cmd_hint status)"
   fi
 
   place_binary
   say "Switching from ${previous:-none} to $PLACED_NAME and restarting..."
+  # From here until the watch ends, an interrupt switches back (on_signal).
+  UPGRADE_ROLLBACK_TO="$previous"
+  UPGRADE_PLACED="$PLACED_NAME"
+  UPGRADE_PLACED_NEW=$(( PLACED_EXISTED == 0 ? 1 : 0 ))
   switch_current "$PLACED_NAME"
   systemctl restart "$UNIT_NAME" || true
 
   if service_stays_up "$SALVORIAS_UPGRADE_WATCH_SECONDS"; then
+    UPGRADE_ROLLBACK_TO=""
     say "The service stayed up for ${SALVORIAS_UPGRADE_WATCH_SECONDS}s on $PLACED_NAME."
+    set_previous_link "$previous"
     prune_versions "$PLACED_NAME" "$previous"
     install_self_copy
     banner "Upgrade complete: $PLACED_NAME"
+    say "To switch back to $previous later: $(cmd_hint 'upgrade --rollback')"
     return 0
   fi
 
@@ -1271,13 +1591,83 @@ cmd_upgrade() {
   fi
   say ""
   say "Rolling back to $previous ..."
-  switch_current "$previous"
-  systemctl restart "$UNIT_NAME" || true
-  if (( PLACED_EXISTED == 0 )); then rm -rf "${BIN_ROOT:?}/$PLACED_NAME"; fi
+  undo_upgrade
   if service_stays_up 10; then
     die "Upgrade to $PLACED_NAME failed: the service did not stay up. Rolled back to $previous, which is running again."
   fi
   die "Upgrade to $PLACED_NAME failed and $previous is not staying up either. Check: $(cmd_hint status)"
+}
+
+# Switches back to UPGRADE_ROLLBACK_TO and removes the directory the
+# interrupted or failed upgrade placed, if it created one.
+undo_upgrade() {
+  local to="$UPGRADE_ROLLBACK_TO"
+  UPGRADE_ROLLBACK_TO=""
+  [[ -n "$to" ]] || return 0
+  switch_current "$to"
+  systemctl restart "$UNIT_NAME" || true
+  if (( UPGRADE_PLACED_NEW == 1 )) && [[ -n "$UPGRADE_PLACED" && "$UPGRADE_PLACED" != "$to" ]]; then
+    rm -rf "${BIN_ROOT:?}/$UPGRADE_PLACED"
+  fi
+}
+
+# Brings an install made by an earlier installer version to the current
+# layout: the root-owned data directory and address record, and the unit
+# file without ReadWritePaths. Safe to repeat. Sets UNIT_CHANGED.
+UNIT_CHANGED=0
+repair_layout() {
+  local before
+  secure_data_dir
+  [[ -e "$KEY_FILE" ]] || die "The node key $KEY_FILE is missing."
+  require_data_file "$KEY_FILE"
+  write_address_file
+  before=$(file_sha "$UNIT_FILE")
+  write_unit_file
+  UNIT_CHANGED=0
+  if [[ "$(file_sha "$UNIT_FILE")" != "$before" ]]; then
+    UNIT_CHANGED=1
+    systemctl daemon-reload
+    say "Updated $UNIT_FILE to the current layout."
+  fi
+}
+
+# upgrade --rollback: switches to the version kept by the last upgrade,
+# watches it like an upgrade, and switches forward again if it fails. The two
+# versions trade places, so a second --rollback goes forward again.
+upgrade_rollback() {
+  local current previous
+  banner "Rolling back the Salvorias node"
+  repair_layout
+  current=$(current_version_name)
+  previous=$(previous_version_name)
+  if [[ -z "$previous" || "$previous" == "$current" || "$previous" == */* || -L "$BIN_ROOT/$previous" \
+      || ! -x "$BIN_ROOT/$previous/salvorias-node" ]]; then
+    die "There is no previous version kept on this server to roll back to."
+  fi
+  check_elf "$BIN_ROOT/$previous/salvorias-node" || die "The kept version $previous cannot be used: $ELF_PROBLEM."
+  say "Switching from $current to $previous and restarting..."
+  UPGRADE_ROLLBACK_TO="$current"
+  UPGRADE_PLACED=""
+  UPGRADE_PLACED_NEW=0
+  switch_current "$previous"
+  systemctl restart "$UNIT_NAME" || true
+  if service_stays_up "$SALVORIAS_UPGRADE_WATCH_SECONDS"; then
+    UPGRADE_ROLLBACK_TO=""
+    set_previous_link "$current"
+    banner "Rolled back to $previous"
+    say "To go forward to $current again: $(cmd_hint 'upgrade --rollback')"
+    return 0
+  fi
+  say ""
+  say "Log from the failed start:"
+  show_journal 15
+  say ""
+  say "Switching back to $current ..."
+  undo_upgrade
+  if service_stays_up 10; then
+    die "Rollback to $previous failed: the service did not stay up. Switched back to $current, which is running again."
+  fi
+  die "Rollback to $previous failed and $current is not staying up either. Check: $(cmd_hint status)"
 }
 
 # Keeps the current and previous version directories, removes the rest.
@@ -1294,17 +1684,28 @@ prune_versions() {
 
 # ─── backup-key ────────────────────────────────────────────────────────────
 
+# The key is copied once into the root-only temp dir, checked there, and the
+# backup is written from that checked copy.
 cmd_backup_key() {
   require_root
-  [[ -f "$KEY_FILE" ]] || die "No node key found at $KEY_FILE."
+  secure_data_dir
+  [[ -e "$KEY_FILE" || -L "$KEY_FILE" ]] || die "No node key found at $KEY_FILE."
+  require_data_file "$KEY_FILE"
   local out="${OPT_OUT:-/root/salvorias-node-key-backup-$(date +%Y%m%d-%H%M%S).txt}"
-  [[ ! -e "$out" ]] || die "$out already exists. Choose another path with --out."
+  [[ ! -e "$out" && ! -L "$out" ]] || die "$out already exists. Choose another path with --out."
   [[ -d "$(dirname "$out")" ]] || die "Directory $(dirname "$out") does not exist."
-  ( umask 077; set -o noclobber; cat -- "$KEY_FILE" >"$out" ) || die "Could not write $out."
-  chown root:root "$out"
+  make_tmp_dir
+  local staged="$TMP_DIR/key-backup" addr=""
+  ( umask 077; head -c 4096 -- "$KEY_FILE" >"$staged" ) || die "Could not read $KEY_FILE."
+  if [[ -x "$PATH_LINK" ]]; then
+    derive_address "$PATH_LINK" "$staged" || die "$KEY_FILE does not hold exactly one valid node key. Nothing was written."
+    addr="$DERIVED_ADDRESS"
+  else
+    warn "The node binary is not installed, so the key file could not be checked before copying."
+  fi
+  ( umask 077; set -o noclobber; cat -- "$staged" >"$out" ) || die "Could not write $out."
+  chown -h root:root "$out"
   chmod 0600 "$out"
-  local addr=""
-  if [[ -f "$ADDRESS_FILE" ]]; then addr=$(head -n 1 "$ADDRESS_FILE"); fi
 
   banner "Node key backed up"
   say "  File:  $out (mode 0600, root only)"
@@ -1331,7 +1732,12 @@ confirm_typed() {
 cmd_uninstall() {
   require_root
   local addr=""
-  if [[ -f "$ADDRESS_FILE" ]]; then addr=$(head -n 1 "$ADDRESS_FILE"); fi
+  # Only read from a directory the service cannot change (the current layout).
+  if [[ -d "$DATA_DIR" && ! -L "$DATA_DIR" && "$(stat -c '%u' -- "$DATA_DIR")" == 0 \
+      && -f "$ADDRESS_FILE" && ! -L "$ADDRESS_FILE" ]]; then
+    addr=$(head -c 100 -- "$ADDRESS_FILE" | head -n 1)
+    is_address "$addr" || addr=""
+  fi
   if [[ -f "$STATE_FILE" ]]; then
     local recorded
     recorded=$(sed -n 's/^NODE_ADDRESS=//p' "$STATE_FILE" | head -n 1)
@@ -1348,6 +1754,13 @@ cmd_uninstall() {
     say "It also DELETES the node key $KEY_FILE (--purge-key)."
   else
     say "It keeps the node key $KEY_FILE (a later install reuses it)."
+  fi
+
+  # Checked before any question or change: purging shreds the key as root,
+  # so it must be a regular file in a directory the service cannot change.
+  if (( OPT_PURGE_KEY == 1 )); then
+    secure_data_dir
+    if [[ -e "$KEY_FILE" || -L "$KEY_FILE" ]]; then require_data_file "$KEY_FILE"; fi
   fi
 
   # Ask every question before changing anything, so a "no" leaves the
@@ -1379,8 +1792,10 @@ cmd_uninstall() {
 
   if (( OPT_PURGE_KEY == 1 )); then
     if [[ -e "$KEY_FILE" ]]; then
+      require_data_file "$KEY_FILE"
       shred -u "$KEY_FILE" 2>/dev/null || rm -f "$KEY_FILE"
     fi
+    # rm -r removes links without following them.
     rm -rf "$DATA_DIR"
     if id -u "$SERVICE_USER" >/dev/null 2>&1; then userdel "$SERVICE_USER" >/dev/null 2>&1 || true; fi
     say "Deleted the node key, $DATA_DIR and the $SERVICE_USER user."
@@ -1417,6 +1832,7 @@ OPT_IMPORT_KEY=""
 OPT_OUT=""
 OPT_PURGE_KEY=0
 OPT_YES=0
+OPT_ROLLBACK=0
 SEEN_FLAGS=()
 
 need_value() {
@@ -1445,6 +1861,7 @@ parse_args() {
       --import-key) need_value "$@"; OPT_IMPORT_KEY="$2"; shift ;;
       --out) need_value "$@"; OPT_OUT="$2"; shift ;;
       --purge-key) OPT_PURGE_KEY=1 ;;
+      --rollback) OPT_ROLLBACK=1 ;;
       --yes|-y) OPT_YES=1 ;;
       *) usage_error "Unknown argument: $1" ;;
     esac
@@ -1456,7 +1873,7 @@ parse_args() {
     install) allowed=" --network --rpc-url --owner --binary --self --version --wait-minutes --import-key " ;;
     resume) allowed=" --wait-minutes --self " ;;
     status) allowed=" " ;;
-    upgrade) allowed=" --binary --version --self " ;;
+    upgrade) allowed=" --binary --version --self --rollback " ;;
     backup-key) allowed=" --out " ;;
     uninstall) allowed=" --purge-key --yes -y " ;;
   esac
@@ -1470,13 +1887,21 @@ parse_args() {
   if [[ -n "$OPT_BINARY" && -n "$OPT_VERSION" ]]; then
     usage_error "Use either --binary or --version, not both."
   fi
+  if (( OPT_ROLLBACK == 1 )) && [[ -n "$OPT_BINARY$OPT_VERSION$OPT_SELF" ]]; then
+    usage_error "--rollback switches to the kept previous version; it takes no --binary, --version or --self."
+  fi
+  is_safe_repo "$SALVORIAS_RELEASE_REPO" || usage_error "SALVORIAS_RELEASE_REPO must be a GitHub owner/name (letters, digits, . _ -): $SALVORIAS_RELEASE_REPO"
+  if [[ -n "$SALVORIAS_RELEASE_BASE_URL" ]]; then require_safe_url "$SALVORIAS_RELEASE_BASE_URL" "SALVORIAS_RELEASE_BASE_URL"; fi
+  if [[ -n "$OPT_RPC_URL" ]]; then require_safe_url "$OPT_RPC_URL" "--rpc-url"; fi
   if ! is_uint "$OPT_WAIT_MINUTES" || (( OPT_WAIT_MINUTES < 1 )); then
     usage_error "--wait-minutes must be a whole number of minutes (1 or more)."
   fi
   if ! is_uint "$SALVORIAS_POLL_SECONDS" || (( SALVORIAS_POLL_SECONDS < 1 )); then
     usage_error "SALVORIAS_POLL_SECONDS must be a whole number of seconds (1 or more)."
   fi
-  is_uint "$SALVORIAS_UPGRADE_WATCH_SECONDS" || usage_error "SALVORIAS_UPGRADE_WATCH_SECONDS must be a whole number of seconds."
+  if ! is_uint "$SALVORIAS_UPGRADE_WATCH_SECONDS" || (( SALVORIAS_UPGRADE_WATCH_SECONDS < MIN_UPGRADE_WATCH_SECONDS )); then
+    usage_error "SALVORIAS_UPGRADE_WATCH_SECONDS must be a whole number of seconds, at least $MIN_UPGRADE_WATCH_SECONDS (a shorter watch cannot tell a working upgrade from a crashing one)."
+  fi
 }
 
 main() {
@@ -1489,7 +1914,7 @@ main() {
   umask 077
   detect_running_file
   trap cleanup EXIT
-  trap on_signal INT TERM
+  trap on_signal INT TERM HUP
   parse_args "$@"
   case "$COMMAND" in
     install) cmd_install ;;

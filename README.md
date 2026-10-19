@@ -38,7 +38,12 @@ not run a server, use Save Hosting in the Salvorias app instead.
 - It **never sends a transaction**. Registering the node is something you do
   yourself in the app, confirmed with your passcode.
 - It **verifies every download** against the release's `checksums.txt`, and
-  aborts if anything does not match.
+  aborts if anything does not match. Every download and RPC request is
+  pinned to HTTPS, redirects included, and a node binary must be a Linux
+  executable for this server's CPU before it is ever run.
+- Root never follows a link the node service could have planted: the data
+  directory belongs to root, and every file root touches there must be a
+  regular file.
 - It refuses to set up a second node on a server that already has one.
 
 ## Install
@@ -46,14 +51,14 @@ not run a server, use Save Hosting in the Salvorias app instead.
 Download the script, read it if you like, then run it:
 
 ```bash
-curl -fsSLO https://github.com/NodeSolutionsAI/salvorias-node-selfhost/releases/latest/download/install.sh
+curl --proto '=https' --proto-redir '=https' -fsSLO https://github.com/NodeSolutionsAI/salvorias-node-selfhost/releases/latest/download/install.sh
 sudo bash install.sh
 ```
 
 or in one line:
 
 ```bash
-curl -fsSL https://github.com/NodeSolutionsAI/salvorias-node-selfhost/releases/latest/download/install.sh | sudo bash
+curl --proto '=https' --proto-redir '=https' -fsSL https://github.com/NodeSolutionsAI/salvorias-node-selfhost/releases/latest/download/install.sh | sudo bash
 ```
 
 The default network is **mainnet**. To try it on testnet first, add
@@ -81,16 +86,21 @@ The default network is **mainnet**. To try it on testnet first, add
    > Open the Salvorias app > Licenses > Self Setup, paste this node address,
    > choose a free slot, confirm with your passcode.
 
-   It also tells you how much SAVDR to send to the node address. That is the
-   cost of one check-in at today's fee, plus a suggested amount for about 90
-   days of daily check-ins.
+   It also tells you how much SAVDR to keep on the node address: the
+   per-check-in reserve. That is the balance the chain requires before it
+   accepts a check-in (gas limit x today's maximum fee), not the fee it
+   charges; actual fees are lower. The suggested amount for about 90 days is
+   the reserve plus 90 check-ins charged at the full reserve, so it is an
+   upper bound at today's fee.
 7. **Waits for the registration** to appear on-chain. It checks every 15
    seconds, for up to 30 minutes by default (`--wait-minutes N`).
    - Ctrl-C is safe. Your node key is kept, and you continue later with
      `sudo salvorias-selfhost resume`.
 8. **Starts the node** as the `salvorias-node` systemd service, enabled at
    boot, then prints a summary.
-   - If the node has less SAVDR than one check-in costs, it warns you.
+   - If the service cannot be started, the install is not marked finished:
+     fix the problem it shows, then run `sudo salvorias-selfhost resume`.
+   - If the node holds less SAVDR than the per-check-in reserve, it warns you.
 
 ### Non-interactive install
 
@@ -103,8 +113,9 @@ sudo bash install.sh --owner 0xYourLicenseWalletAddress --wait-minutes 60
 | Command | What it does |
 | --- | --- |
 | `sudo salvorias-selfhost status` | Service state, version, node address, slot binding, balance, approximate check-ins left, last 20 log lines |
-| `sudo salvorias-selfhost resume` | Continue an install that was waiting for registration |
-| `sudo salvorias-selfhost upgrade [--version vX]` | Download and verify a newer node release, switch to it, restart. If the service is not running steadily after 30 seconds, it switches back to the previous version. Also updates `salvorias-selfhost` itself. |
+| `sudo salvorias-selfhost resume` | Continue an install that was waiting for registration, or whose service did not start |
+| `sudo salvorias-selfhost upgrade [--version vX]` | Download and verify a newer node release, switch to it, restart. If the service is not running steadily after 30 seconds, or you press Ctrl-C while it watches, it switches back to the previous version. Also updates `salvorias-selfhost` itself. With the binary already current, it restarts a stopped service, and it brings an install made by an older installer to the current file layout. |
+| `sudo salvorias-selfhost upgrade --rollback` | Switch back to the version kept by the last upgrade, restart and watch it. Run it again to go forward. |
 | `sudo salvorias-selfhost backup-key [--out PATH]` | Copy the node key to a root-only file (mode 0600) for offline storage. It never prints the key. |
 | `sudo salvorias-selfhost uninstall [--yes] [--purge-key]` | Remove the service, binary and config. The node key is **kept** unless you pass `--purge-key` and type the confirmation. |
 | `sudo journalctl -u salvorias-node -f` | Follow the node's log |
@@ -116,9 +127,12 @@ Salvorias app under Licenses.
 ### Funding
 
 The node wallet pays the network fee for each check-in, so keep SAVDR on the
-**node address** (not your license wallet). `status` shows the balance and
-roughly how many check-ins it covers. The node never pays more than 50 gwei
-per unit of gas (see Configuration below).
+**node address** (not your license wallet). Keep at least the per-check-in
+reserve there: the chain only accepts a check-in from a wallet holding gas
+limit x maximum fee, even though the fee it charges is lower. `status` shows
+the balance, the reserve and at least how many check-ins the balance covers.
+The node never pays more than 50 gwei per unit of gas (see Configuration
+below).
 
 ### Back up the node key
 
@@ -152,7 +166,10 @@ Anyone with the key controls the node wallet and the SAVDR on it.
 
 `--import-key` accepts a file holding exactly one key: 64 hex characters,
 with or without `0x`, optionally followed by a newline. It refuses a file
-that other users can read.
+that other users can read, and a symbolic link. The file is read once, into
+a root-only copy that everything else works from. If an earlier uninstall
+kept a key on this server, importing the same key (in any accepted format)
+is fine; a different key is refused.
 
 ## Files on the server
 
@@ -160,21 +177,29 @@ that other users can read.
 | --- | --- | --- |
 | `/opt/salvorias/bin/<version>/salvorias-node` | root, 0755 | Node binaries (the current and previous versions are kept) |
 | `/opt/salvorias/bin/current` | symlink | Points at the running version |
+| `/opt/salvorias/bin/previous` | symlink | The version `upgrade --rollback` switches to |
 | `/usr/local/bin/salvorias-node` | symlink | `-> /opt/salvorias/bin/current/salvorias-node` |
 | `/usr/local/sbin/salvorias-selfhost` | root, 0755 | This installer, for later commands |
 | `/etc/salvorias/` | root:salvorias, 0750 | Configuration |
 | `/etc/salvorias/node.env` | root:salvorias, 0640 | Daemon settings (no secrets) |
 | `/etc/salvorias/selfhost.conf` | root:salvorias, 0640 | What the installer set up (network, owner, node address) |
-| `/var/lib/salvorias/` | salvorias, 0700 | Node data |
+| `/var/lib/salvorias/` | root:salvorias, 0750 | Node data. The service can read it, not change it |
 | `/var/lib/salvorias/node-key.txt` | salvorias, 0600 | **The node's private key** |
+| `/var/lib/salvorias/node-address.txt` | root, 0644 | The node's public address |
 | `/etc/systemd/system/salvorias-node.service` | root, 0644 | The service |
 
 The service runs as the unprivileged `salvorias` user and is sandboxed:
 - `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp` and `NoNewPrivileges`;
-- it can only write to `/var/lib/salvorias`;
+- it cannot write anywhere on disk (it logs to the journal), including its
+  own key directory;
 - memory is capped at 200 MB.
 
 It logs to journald as `salvorias-node`.
+
+If a `salvorias` account already exists, the installer uses it only if it
+looks like the system account it would create itself: a system UID, its own
+`salvorias` group with no other members, a `nologin` or `false` shell, and no
+real home directory. Otherwise it stops and says why.
 
 ## Configuration
 
@@ -199,8 +224,9 @@ It logs to journald as `salvorias-node`.
 | Treasury | `0xDEfad8fE8Af1ef0B8d0D00251A80391c9Ed04243` | `0x7e8ecebF965dE86fDE7Ebc7F3020813d656CF723` |
 
 `--rpc-url` points the installer and the node at a different RPC endpoint for
-the same network. It must be `https://`; plain `http://` is only accepted for
-localhost. The installer checks the chain ID before it does anything else.
+the same network. It must be `https://` with a plain host name and path (no
+`user@`, quotes, spaces or `%`); plain `http://` is only accepted for exactly
+`http://127.0.0.1` or `http://localhost`, with an optional port and path. The installer checks the chain ID before it does anything else.
 
 ## All options
 
@@ -211,6 +237,7 @@ install (default)  --owner 0x...  --network mainnet|testnet  --rpc-url URL
 resume             --wait-minutes N
 status
 upgrade            --version vX  --binary PATH  --self PATH
+upgrade            --rollback
 backup-key         --out PATH
 uninstall          --yes  --purge-key
 -h, --help         --version (installer version, as the only argument)
@@ -218,7 +245,8 @@ uninstall          --yes  --purge-key
 
 - `--binary PATH` uses a local node binary instead of downloading one. It is
   for offline installs and testing. The binary is **not** checksum-verified;
-  the installer prints its sha256 so you can compare it yourself.
+  the installer prints its sha256 so you can compare it yourself. It must
+  still be a Linux executable for this server's CPU.
 - `--self PATH` installs that file as `salvorias-selfhost` instead of the
   running script or a release download. It is for offline installs and
   testing.
@@ -228,7 +256,8 @@ uninstall          --yes  --purge-key
 | `SALVORIAS_RELEASE_BASE_URL` | GitHub Releases (`.../releases/download/<tag>`, or `.../releases/latest/download`) | Where the binaries, `install.sh` and `checksums.txt` are downloaded from |
 | `SALVORIAS_WAIT_MINUTES` | 30 | Default for `--wait-minutes` |
 | `SALVORIAS_POLL_SECONDS` | 15 | Registration poll interval |
-| `SALVORIAS_UPGRADE_WATCH_SECONDS` | 30 | How long `upgrade` watches the new version before keeping it |
+| `SALVORIAS_UPGRADE_WATCH_SECONDS` | 30 | How long `upgrade` watches the new version before keeping it (at least 10) |
+| `SALVORIAS_RELEASE_REPO` | `NodeSolutionsAI/salvorias-node-selfhost` | GitHub `owner/name` for release downloads (letters, digits, `.`, `_`, `-`) |
 
 Exit codes:
 
@@ -261,11 +290,14 @@ assets:
 - `salvorias-node-linux-x64` and `salvorias-node-linux-arm64`, built from
   `node-checkin` with
   `bun build ./cli.js --compile --target=bun-linux-x64|bun-linux-arm64`
+  (the installer needs `key-address`, so salvorias-node 0.0.9 or later)
 - `install.sh` (this file, unchanged)
 - `checksums.txt` in `sha256sum` format, covering **all three files above**:
   `sha256sum salvorias-node-linux-x64 salvorias-node-linux-arm64 install.sh > checksums.txt`
 
-The installer refuses any asset that has no entry in `checksums.txt`.
+The installer refuses any asset that has no entry in `checksums.txt`, or two
+entries that disagree. Both `sha256sum` line forms (`hash  name` and
+`hash *name`) and CRLF line endings are accepted.
 
 ## Testing
 
