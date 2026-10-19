@@ -78,7 +78,8 @@ messages, files, owners and modes.
   - the unit tests, help and version;
   - a non-root run is refused;
   - unknown and misplaced flags are refused;
-  - a private key passed as `--owner` is refused and never echoed;
+  - a private key passed as `--owner` is refused and never echoed (checked
+    on the raw output; the transcript shows the step with the value masked);
   - a wrong chain is refused;
   - RPC URLs: plain http to a remote host, `http://localhost:1@evil.example/`
     and a URL with a quote are refused;
@@ -95,7 +96,7 @@ messages, files, owners and modes.
   - a **piped run** (`cat install.sh | bash -s --`) that reads its prompts
     from `/dev/tty`: a typed private key and a seed phrase are both rejected,
     then a valid address is accepted. The pty echoes what was typed, so the
-    fake key is masked in the log before the log is shown;
+    fake key is masked in the step header and the log before they are shown;
   - release downloads: a checksum that verifies, a CRLF `checksums.txt` with
     `*name` entries that verifies, and a tampered binary, an empty
     `checksums.txt` and a missing entry that are each refused.

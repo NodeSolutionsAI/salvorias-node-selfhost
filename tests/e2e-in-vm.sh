@@ -48,6 +48,7 @@ mkdir -p "$OUT" "$MOCK_STATE" "$FAITHFUL_STATE"
 PASS=0
 FAIL=0
 RC=0
+MASK_HITS=0
 PIDS=()
 STEP=0
 RUN_MASK=""
@@ -67,18 +68,26 @@ pass() { PASS=$((PASS + 1)); printf 'PASS: %s\n' "$*"; }
 fail() { FAIL=$((FAIL + 1)); printf 'FAIL: %s\n' "$*"; }
 
 # run NAME CMD...: runs CMD, keeps its output in $OUT/NAME.log, shows it, sets
-# RC. With RUN_MASK set, that string is replaced in the log BEFORE the log is
-# shown, so it never reaches the transcript.
+# RC. With RUN_MASK set, that string is replaced in the step header and in
+# the log BEFORE either is shown, so it never reaches the transcript.
+# MASK_HITS counts the occurrences in the raw log, before masking, for checks
+# that the command itself never printed it.
 run() {
-  local name="$1"
+  local name="$1" shown
   shift
   STEP=$((STEP + 1))
-  printf '\n--- [%02d] $ %s\n' "$STEP" "$*"
+  shown="$*"
+  if [[ -n "$RUN_MASK" ]]; then shown="${shown//"$RUN_MASK"/<masked>}"; fi
+  printf '\n--- [%02d] $ %s\n' "$STEP" "$shown"
   set +e
   "$@" >"$OUT/$name.log" 2>&1
   RC=$?
   set -e
-  if [[ -n "$RUN_MASK" ]]; then sed -i "s/$RUN_MASK/<masked>/g" "$OUT/$name.log"; fi
+  MASK_HITS=0
+  if [[ -n "$RUN_MASK" ]]; then
+    MASK_HITS=$(grep -cF -- "$RUN_MASK" "$OUT/$name.log" || true)
+    sed -i "s/$RUN_MASK/<masked>/g" "$OUT/$name.log"
+  fi
   sed 's/^/    | /' "$OUT/$name.log"
   printf '    (exit %s)\n' "$RC"
 }
@@ -229,10 +238,12 @@ run wrong-cmd-flag bash "$INSTALL" status --owner "$OWNER"
 expect_rc 2 "flag that does not apply to the command"
 run rollback-binary bash "$INSTALL" upgrade --rollback --binary "$BIN"
 expect_rc 2 "upgrade --rollback with --binary is refused"
+RUN_MASK="$FAKE_SECRET"
 run privkey-flag bash "$INSTALL" --network testnet --binary "$BIN" --owner "0x$FAKE_SECRET"
+RUN_MASK=""
 expect_rc 2 "a private key passed as --owner is rejected"
 expect_log privkey-flag 'looks like a PRIVATE KEY' "private-key warning shown"
-expect_no_log privkey-flag "$FAKE_SECRET" "the rejected secret is not echoed back"
+expect_true "the rejected secret is not echoed back (raw output)" test "$MASK_HITS" = 0
 run wrong-chain bash "$INSTALL" --network mainnet --rpc-url "$TESTNET_RPC" --binary "$BIN" --owner "$OWNER"
 expect_rc 1 "mainnet with a testnet RPC is refused"
 expect_log wrong-chain 'is chain 7283, but mainnet is chain 7282' "chain id mismatch explained"
