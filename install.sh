@@ -804,6 +804,9 @@ ST_STAGE=""
 # yes when this installer created the salvorias account, else no. Only then
 # may `uninstall --purge-key` delete it.
 ACCOUNT_CREATED=""
+# The UID of that account when it was created, so a purge never deletes a
+# different account that was later made with the same name.
+ACCOUNT_UID=""
 
 write_state() {
   local tmp
@@ -823,6 +826,7 @@ TREASURY_CONTRACT=$NET_TREASURY
 OWNER_ADDRESS=$OWNER
 NODE_ADDRESS=$NODE_ADDRESS
 ACCOUNT_CREATED=${ACCOUNT_CREATED:-no}
+ACCOUNT_UID=${ACCOUNT_UID}
 EOF
   chown root:"$SERVICE_USER" "$tmp"
   chmod 0640 "$tmp"
@@ -848,6 +852,7 @@ load_state() {
       OWNER_ADDRESS) owner="$value" ;;
       NODE_ADDRESS) node="$value" ;;
       ACCOUNT_CREATED) [[ "$value" == "yes" ]] && ACCOUNT_CREATED=yes ;;
+      ACCOUNT_UID) is_uint "$value" && ACCOUNT_UID="$value" ;;
     esac
   done <"$STATE_FILE"
 
@@ -950,12 +955,15 @@ ensure_user() {
     nologin=$(command -v nologin || printf '/usr/sbin/nologin')
     useradd --system --user-group --no-create-home --home-dir /nonexistent --shell "$nologin" "$SERVICE_USER"
     ACCOUNT_CREATED=yes
+    ACCOUNT_UID=$(id -u "$SERVICE_USER")
     say "Created system user: $SERVICE_USER"
   elif account_marker_matches; then
     ACCOUNT_CREATED=yes
+    ACCOUNT_UID=$(id -u "$SERVICE_USER")
     say "Using the system user $SERVICE_USER that this installer created for an earlier install."
   else
     ACCOUNT_CREATED=no
+    ACCOUNT_UID=""
     say "Using the existing system user $SERVICE_USER. This installer did not create it, so 'uninstall --purge-key' keeps it."
   fi
 }
@@ -1926,8 +1934,13 @@ cmd_uninstall() {
     recorded=$(sed -n 's/^NODE_ADDRESS=//p' "$STATE_FILE" | head -n 1)
     if is_address "$recorded"; then addr="$recorded"; fi
     recorded=$(sed -n 's/^ACCOUNT_CREATED=//p' "$STATE_FILE" | head -n 1)
-    if [[ "$recorded" == "yes" ]]; then
+    local recorded_uid current_uid
+    recorded_uid=$(sed -n 's/^ACCOUNT_UID=//p' "$STATE_FILE" | head -n 1)
+    current_uid=$(id -u "$SERVICE_USER" 2>/dev/null || true)
+    if [[ "$recorded" == "yes" ]] && is_uint "$recorded_uid" && [[ "$recorded_uid" == "$current_uid" ]]; then
       account_created=yes
+    elif [[ "$recorded" == "yes" ]]; then
+      account_why="it is not the account this installer created (its UID does not match the recorded one)"
     elif [[ -z "$recorded" ]]; then
       account_why="this install predates the installer's record of who created it"
     fi

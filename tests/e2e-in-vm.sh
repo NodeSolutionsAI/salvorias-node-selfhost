@@ -877,12 +877,25 @@ printf 'e2e stray\n' >/usr/local/sbin/.salvorias-selfhost.e2eXYZ
 printf 'e2e stray\n' >/etc/systemd/system/.salvorias-node.service.e2eXYZ
 install -d -m 0700 "$DATA/.stage.e2eXYZ"
 printf 'e2e: not a key\n' >"$DATA/.stage.e2eXYZ/node-key.txt"
+# The installer's account is replaced by a hand-made one with the same name
+# (different UID) before the purge: the recorded UID no longer matches, so
+# the purge must keep the replacement.
+systemctl stop salvorias-node.service
+old_uid=$(id -u salvorias)
+userdel salvorias
+new_uid=$((old_uid - 1))
+while getent passwd "$new_uid" >/dev/null || getent group "$new_uid" >/dev/null; do new_uid=$((new_uid - 1)); done
+useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin -u "$new_uid" salvorias
+expect_true "replacement account has a different UID" test "$(id -u salvorias)" != "$old_uid"
 run purge-final with_tty "uninstall
 delete node key
 " "$SELF uninstall --purge-key"
 expect_rc 0 "final purge"
 expect_log purge-final 'Removed 3 file\(s\) left by an interrupted run' "leftovers reported"
-expect_log purge-final 'Deleted the salvorias user' "user deletion reported"
+expect_log purge-final 'Kept the salvorias user: it is not the account this installer created' "a replacement account with another UID is kept"
+expect_no_log purge-final 'Deleted the salvorias user' "the replacement account is not deleted"
+expect_true "replacement account still exists" test "$(id -u salvorias 2>/dev/null)" == "$new_uid"
+userdel salvorias
 expect_true "leftover temp files removed" \
   test ! -e /usr/local/sbin/.salvorias-selfhost.e2eXYZ -a ! -e /etc/systemd/system/.salvorias-node.service.e2eXYZ
 expect_true "server clean" nothing_installed
