@@ -2,9 +2,10 @@
 # Runs tests/e2e-in-vm.sh inside a disposable Lima Ubuntu 24.04 VM.
 #
 # Usage: tests/e2e-lima.sh [--keep-vm] [--arch aarch64|x86_64] <bin-dir>
-#   <bin-dir> holds salvorias-node-linux-<arch> (the build under test) and
+#   <bin-dir> holds salvorias-node-linux-<arch> (the build under test),
 #   next/salvorias-node-linux-<arch> (a build reporting a different version,
-#   used for the upgrade test). See tests/README.md for how to build both.
+#   used for the upgrade test) and broken/salvorias-node-linux-<arch>
+#   (tests/broken-node.js, built). See tests/README.md for how to build them.
 #
 # The VM is created fresh and deleted afterwards unless --keep-vm is given.
 # The transcript is written to e2e-transcript.txt in the current directory.
@@ -48,15 +49,18 @@ case "$(limactl shell "$VM" uname -m)" in
   aarch64) ASSET="salvorias-node-linux-arm64" ;;
   *) echo "unexpected VM architecture" >&2; exit 1 ;;
 esac
-[[ -f "$BIN_DIR/$ASSET" && -f "$BIN_DIR/next/$ASSET" ]] || { echo "need $BIN_DIR/$ASSET and $BIN_DIR/next/$ASSET" >&2; exit 1; }
+for f in "$ASSET" "next/$ASSET" "broken/$ASSET"; do
+  [[ -f "$BIN_DIR/$f" ]] || { echo "need $BIN_DIR/$f" >&2; exit 1; }
+done
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
-mkdir -p "$STAGE/selfhost-e2e/tests" "$STAGE/selfhost-e2e/bin/next"
+mkdir -p "$STAGE/selfhost-e2e/tests" "$STAGE/selfhost-e2e/bin/next" "$STAGE/selfhost-e2e/bin/broken"
 cp "$REPO/install.sh" "$STAGE/selfhost-e2e/"
 cp "$REPO/tests/e2e-in-vm.sh" "$REPO/tests/unit-math.sh" "$REPO/tests/mock-rpc.py" "$STAGE/selfhost-e2e/tests/"
 cp "$BIN_DIR/$ASSET" "$STAGE/selfhost-e2e/bin/"
 cp "$BIN_DIR/next/$ASSET" "$STAGE/selfhost-e2e/bin/next/"
+cp "$BIN_DIR/broken/$ASSET" "$STAGE/selfhost-e2e/bin/broken/"
 
 limactl shell "$VM" sudo rm -rf /tmp/selfhost-e2e
 limactl copy -r "$STAGE/selfhost-e2e" "$VM:/tmp/selfhost-e2e"

@@ -8,18 +8,26 @@ a license:
   NFT.balanceOf(owner, 1)          -> --licenses
   NodeCheckIn.findOpenSlots(owner) -> --open-slots, minus the bound slot
   NodeCheckIn.nodeToOwner(node)    -> owner, once <state-dir>/bound-node holds node
-  NodeCheckIn.nodeToSlot(node)     -> --bound-slot, for that bound node
+  NodeCheckIn.nodeAddressOf(owner, i) -> the bound node at --bound-slot, else
+                                     the zero address (the slot-info scan path)
   eth_getBalance(bound node)       -> <state-dir>/balance-wei, if that file exists
+  eth_gasPrice, eth_maxPriorityFeePerGas -> --fee-wei, if given
 
-With --emulate-node-to-slot it also answers nodeToSlot(node) for unbound
-nodes (0, the mapping default). The mainnet NodeCheckIn implementation has
-that getter, but the testnet deployment at the time of writing does not: a
-real nodeToSlot call there reverts for every node, which makes
-`salvorias-node slot-info --node` fail on testnet. The flag lets the installer's
-flow be tested on testnet the way it behaves on mainnet.
+--fee-wei pins a non-zero fee, so the funding text and the daemon's
+network-mode fee fields are exercised whatever the testnet fee is that day.
+
+With --emulate-node-to-slot it also answers nodeToSlot(node): --bound-slot for
+the bound node, 0 (the mapping default) for any other. That is how the mainnet
+NodeCheckIn behaves. The testnet deployment has no nodeToSlot getter: a real
+call reverts for every node, and salvorias-node 0.0.9+ then finds the slot by
+scanning nodeAddressOf (slot-info reports "boundSlotSource":"scan"). Without
+the flag this mock is faithful to testnet: nodeToSlot goes upstream and
+reverts, and the mock answers the nodeAddressOf scan.
 
 It refuses eth_sendRawTransaction and eth_sendTransaction outright and logs
-the attempt, so nothing run against it can ever send a transaction.
+the attempt, so nothing run against it can ever send a transaction. A refused
+raw transaction is decoded first and its fee fields are logged (never the
+signature), so the test can check what the daemon tried to send.
 
 Usage:
   mock-rpc.py --listen 127.0.0.1:8545 --upstream https://testnet.salvorias.net \
@@ -39,6 +47,7 @@ SEL_BALANCE_OF = "0x00fdd58e"      # balanceOf(address,uint256)
 SEL_FIND_OPEN_SLOTS = "0x79006210"  # findOpenSlots(address,uint256)
 SEL_NODE_TO_OWNER = "0x40d5a7a7"    # nodeToOwner(address)
 SEL_NODE_TO_SLOT = "0x1b0eae60"     # nodeToSlot(address)
+SEL_NODE_ADDRESS_OF = "0x4fb1f363"  # nodeAddressOf(address,uint256)
 BLOCKED_METHODS = {"eth_sendRawTransaction", "eth_sendTransaction"}
 
 LOCK = threading.Lock()
@@ -63,6 +72,60 @@ def enc_uint_array(items):
 def arg_address(data, index):
     start = 10 + 64 * index
     return "0x" + data[start + 24:start + 64].lower()
+
+
+def arg_uint(data, index):
+    start = 10 + 64 * index
+    return int(data[start:start + 64] or "0", 16)
+
+
+def rlp_decode(buf, pos=0):
+    """Decodes one RLP item at pos. Returns (item, next_pos); lists are lists."""
+    b = buf[pos]
+    if b < 0x80:
+        return buf[pos:pos + 1], pos + 1
+    if b < 0xb8:
+        n = b - 0x80
+        return buf[pos + 1:pos + 1 + n], pos + 1 + n
+    if b < 0xc0:
+        ll = b - 0xb7
+        n = int.from_bytes(buf[pos + 1:pos + 1 + ll], "big")
+        start = pos + 1 + ll
+        return buf[start:start + n], start + n
+    if b < 0xf8:
+        n, start = b - 0xc0, pos + 1
+    else:
+        ll = b - 0xf7
+        n = int.from_bytes(buf[pos + 1:pos + 1 + ll], "big")
+        start = pos + 1 + ll
+    items, p = [], start
+    while p < start + n:
+        item, p = rlp_decode(buf, p)
+        items.append(item)
+    return items, start + n
+
+
+def describe_raw_tx(raw):
+    """Summarises a signed raw tx: type, chain, fee fields, gas, target, selector."""
+    buf = bytes.fromhex(raw[2:] if raw.startswith("0x") else raw)
+    num = lambda v: int.from_bytes(v, "big")
+    if buf and buf[0] == 0x02:
+        f, _ = rlp_decode(buf, 1)
+        fields = {"type": 2, "chainId": num(f[0]), "nonce": num(f[1]),
+                  "maxPriorityFeePerGas": num(f[2]), "maxFeePerGas": num(f[3]),
+                  "gasLimit": num(f[4]), "to": "0x" + f[5].hex(), "data": f[7]}
+    elif buf and buf[0] >= 0xc0:
+        f, _ = rlp_decode(buf, 0)
+        v = num(f[6])
+        # EIP-155: v = chainId * 2 + 35 or 36; 27/28 means no chain id.
+        chain = (v - 35) // 2 if v >= 35 else "none"
+        fields = {"type": 0, "chainId": chain, "nonce": num(f[0]), "gasPrice": num(f[1]),
+                  "gasLimit": num(f[2]), "to": "0x" + f[3].hex(), "data": f[5]}
+    else:
+        return f"type=unknown(0x{buf[:1].hex()})"
+    data = fields.pop("data")
+    fields["selector"] = "0x" + data[:4].hex()
+    return " ".join(f"{k}={v}" for k, v in fields.items())
 
 
 class Mock:
@@ -98,12 +161,19 @@ class Mock:
         rid = req.get("id")
         params = req.get("params") or []
         if method in BLOCKED_METHODS:
-            self.log(f"BLOCKED {method}")
+            detail = ""
+            if method == "eth_sendRawTransaction" and params:
+                try:
+                    detail = " " + describe_raw_tx(str(params[0]))
+                except Exception as err:  # still block, even if it cannot be decoded
+                    detail = f" undecodable ({err})"
+            self.log(f"BLOCKED {method}{detail}")
             return {"jsonrpc": "2.0", "id": rid,
                     "error": {"code": -32000, "message": "mock-rpc: transactions are disabled in this test"}}
 
         bound = (self.state("bound-node") or "").lower() or None
         result = None
+        data = ""
         if method == "eth_call" and params:
             call = params[0] or {}
             to = (call.get("to") or "").lower()
@@ -116,17 +186,23 @@ class Mock:
                 result = enc_uint_array(slots)
             elif to == self.checkin and sel == SEL_NODE_TO_OWNER and bound and arg_address(data, 0) == bound:
                 result = enc_address(self.owner)
-            elif to == self.checkin and sel == SEL_NODE_TO_SLOT and bound and arg_address(data, 0) == bound:
-                result = enc_uint(self.o.bound_slot)
             elif to == self.checkin and sel == SEL_NODE_TO_SLOT and self.o.emulate_node_to_slot:
-                result = enc_uint(0)
+                # Without the flag the call goes upstream and reverts, as on testnet.
+                result = enc_uint(self.o.bound_slot if bound and arg_address(data, 0) == bound else 0)
+            elif to == self.checkin and sel == SEL_NODE_ADDRESS_OF and arg_address(data, 0) == self.owner:
+                slot = arg_uint(data, 1)
+                node = bound if bound and slot == self.o.bound_slot else "0x" + "0" * 40
+                result = enc_address(node)
+        elif method in ("eth_gasPrice", "eth_maxPriorityFeePerGas") and self.o.fee_wei is not None:
+            result = hex(self.o.fee_wei)
         elif method == "eth_getBalance" and params and bound and str(params[0]).lower() == bound:
             balance = self.state("balance-wei")
             if balance is not None:
                 result = hex(int(balance))
 
         if result is not None:
-            self.log(f"MOCKED {method} {sel if method == 'eth_call' else ''}".rstrip())
+            sel_note = data[:10] if method == "eth_call" else ""
+            self.log(f"MOCKED {method} {sel_note}".rstrip())
             return {"jsonrpc": "2.0", "id": rid, "result": result}
         resp = self.forward(req)
         if isinstance(resp, dict) and resp.get("error"):
@@ -177,6 +253,8 @@ def main():
     p.add_argument("--bound-slot", type=int, default=1)
     p.add_argument("--state-dir", required=True)
     p.add_argument("--log", default=None)
+    p.add_argument("--fee-wei", type=int, default=None,
+                   help="answer eth_gasPrice and eth_maxPriorityFeePerGas with this fee")
     p.add_argument("--emulate-node-to-slot", action="store_true",
                    help="answer nodeToSlot for unbound nodes too (testnet lacks the getter)")
     opts = p.parse_args()
