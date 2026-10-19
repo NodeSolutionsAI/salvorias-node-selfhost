@@ -58,6 +58,13 @@ UNIT_NAME="salvorias-node.service"
 UNIT_FILE="/etc/systemd/system/$UNIT_NAME"
 SELF_PATH="/usr/local/sbin/salvorias-selfhost"
 SELF_MARKER="# salvorias-selfhost-installer"
+# Held by every command that changes the server (all but status), so two runs
+# can never interleave. In /run itself (root:root 0755), not the world-writable
+# /run/lock, so no other account can create, replace or link this path first.
+LOCK_FILE="/run/salvorias-selfhost.lock"
+# Written into DATA_DIR by an uninstall that keeps the key, so a later install
+# still knows that this installer created the service account.
+ACCOUNT_MARKER="$DATA_DIR/installer-account.txt"
 
 # Self-host wallets are not fee-exempt, so the daemon must pay the live
 # network fee. The cap stops it from paying through a fee spike.
@@ -69,6 +76,7 @@ PROBE_NODE_ADDRESS="0x0000000000000000000000000000000000000001"
 EXIT_ERROR=1
 EXIT_USAGE=2
 EXIT_STOPPED=3
+EXIT_LOCKED=4
 
 # ─── Output helpers ────────────────────────────────────────────────────────
 
@@ -137,7 +145,8 @@ ENVIRONMENT
 
 EXIT CODES
   0 ok   1 error   2 bad usage or input   3 stopped: something to do outside
-  this server (no license, no free slot, not registered yet)   130 interrupted
+  this server (no license, no free slot, not registered yet)   4 another
+  salvorias-selfhost command is running   130 interrupted
 EOF
 }
 
@@ -170,7 +179,9 @@ set_network() {
 # ─── Small validators and arithmetic ──────────────────────────────────────
 
 is_address() { [[ "$1" =~ ^0x[0-9a-fA-F]{40}$ ]]; }
-is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
+# No leading zeros: bash arithmetic reads 08 as invalid octal, so a value
+# that passed here would still fail later in (( )).
+is_uint() { [[ "$1" =~ ^(0|[1-9][0-9]*)$ ]]; }
 lower() { printf '%s' "${1,,}"; }
 
 # Plain http is only accepted for a local endpoint (a test mock or a local
@@ -395,6 +406,31 @@ require_root() {
   fi
 }
 
+# Takes the exclusive lock that every changing command holds until it exits
+# (the kernel drops it with the last open descriptor, also on a crash or a
+# signal). Without it two installs could both pass guard_single_node before
+# either writes its state. The path is refused if it is a link, and the open
+# file must be a root-owned regular file with no other link, so root never
+# writes through anything another account put there. The file is left in
+# place: /run is cleared at boot, and deleting a lock file that another run
+# may already have opened would let two runs hold locks on different files.
+take_lock() {
+  command -v flock >/dev/null 2>&1 || die "flock is required (package util-linux)."
+  [[ ! -L "$LOCK_FILE" ]] || die "$LOCK_FILE is a symbolic link. Refusing to open it. Inspect it, remove it if it is not yours, then rerun."
+  [[ ! -e "$LOCK_FILE" || -f "$LOCK_FILE" ]] || die "$LOCK_FILE is not a regular file. Refusing to use it as the lock. Inspect it, remove it if it is not yours, then rerun."
+  exec {LOCK_FD}<>"$LOCK_FILE" || die "Could not open the lock file $LOCK_FILE."
+  local fd_path="/proc/$$/fd/$LOCK_FD" shape
+  shape=$(stat -L -c '%F:%u:%h' -- "$fd_path") || die "Could not inspect the lock file $LOCK_FILE."
+  [[ "$shape" == "regular file:0:1" || "$shape" == "regular empty file:0:1" ]] \
+    || die "$LOCK_FILE is not a root-owned regular file with a single link ($shape). Refusing to use it as the lock. Inspect it, remove it if it is not yours, then rerun."
+  chmod 0600 -- "$fd_path"
+  if ! flock -n "$LOCK_FD"; then
+    printf 'ERROR: Another salvorias-selfhost command is running on this server (it holds %s). Wait for it to finish, then rerun. Nothing was changed.\n' "$LOCK_FILE" >&2
+    exit "$EXIT_LOCKED"
+  fi
+}
+
+LOCK_FD=""
 ASSET_ARCH=""
 
 check_platform() {
@@ -765,6 +801,9 @@ read_owner() {
 # parsed as KEY=VALUE lines (never sourced) and holds no secrets.
 
 ST_STAGE=""
+# yes when this installer created the salvorias account, else no. Only then
+# may `uninstall --purge-key` delete it.
+ACCOUNT_CREATED=""
 
 write_state() {
   local tmp
@@ -783,6 +822,7 @@ NFT_CONTRACT=$NET_NFT
 TREASURY_CONTRACT=$NET_TREASURY
 OWNER_ADDRESS=$OWNER
 NODE_ADDRESS=$NODE_ADDRESS
+ACCOUNT_CREATED=${ACCOUNT_CREATED:-no}
 EOF
   chown root:"$SERVICE_USER" "$tmp"
   chmod 0640 "$tmp"
@@ -807,6 +847,7 @@ load_state() {
       TREASURY_CONTRACT) treasury="$value" ;;
       OWNER_ADDRESS) owner="$value" ;;
       NODE_ADDRESS) node="$value" ;;
+      ACCOUNT_CREATED) [[ "$value" == "yes" ]] && ACCOUNT_CREATED=yes ;;
     esac
   done <"$STATE_FILE"
 
@@ -899,13 +940,50 @@ check_existing_user() {
   fi
 }
 
+# Records in ACCOUNT_CREATED whether this installer created the account, so
+# that a purge never deletes an account someone else made. An existing
+# account counts as the installer's only when an earlier uninstall left the
+# marker for it (see account_marker_matches).
 ensure_user() {
   if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
     local nologin
     nologin=$(command -v nologin || printf '/usr/sbin/nologin')
     useradd --system --user-group --no-create-home --home-dir /nonexistent --shell "$nologin" "$SERVICE_USER"
+    ACCOUNT_CREATED=yes
     say "Created system user: $SERVICE_USER"
+  elif account_marker_matches; then
+    ACCOUNT_CREATED=yes
+    say "Using the system user $SERVICE_USER that this installer created for an earlier install."
+  else
+    ACCOUNT_CREATED=no
+    say "Using the existing system user $SERVICE_USER. This installer did not create it, so 'uninstall --purge-key' keeps it."
   fi
+}
+
+# True when ACCOUNT_MARKER says the current salvorias account (same UID) was
+# created by this installer. It is trusted only as a single-link root-owned
+# file in a root-owned DATA_DIR, where the service account cannot write. The
+# UID ties it to that account: one deleted and made again by hand does not
+# match.
+account_marker_matches() {
+  local uid
+  uid=$(id -u "$SERVICE_USER" 2>/dev/null) || return 1
+  [[ -d "$DATA_DIR" && ! -L "$DATA_DIR" && "$(stat -c '%u' -- "$DATA_DIR")" == 0 ]] || return 1
+  [[ -f "$ACCOUNT_MARKER" && ! -L "$ACCOUNT_MARKER" && "$(stat -c '%u:%h' -- "$ACCOUNT_MARKER")" == "0:1" ]] || return 1
+  [[ "$(head -c 100 -- "$ACCOUNT_MARKER" | head -n 1)" == "UID=$uid" ]]
+}
+
+# Leaves ACCOUNT_MARKER for the account this installer created, when an
+# uninstall keeps the key (and so the account) but removes the state file.
+# Written in a staging name and renamed, so it never follows a link.
+write_account_marker() {
+  local uid tmp
+  uid=$(id -u "$SERVICE_USER" 2>/dev/null) || return 0
+  [[ -d "$DATA_DIR" && ! -L "$DATA_DIR" && "$(stat -c '%u' -- "$DATA_DIR")" == 0 ]] || return 0
+  tmp=$(mktemp "$DATA_DIR/.stage.XXXXXX") || return 0
+  printf 'UID=%s\n' "$uid" >"$tmp"
+  chmod 0600 "$tmp"
+  mv -fT -- "$tmp" "$ACCOUNT_MARKER"
 }
 
 make_dirs() {
@@ -1838,10 +1916,23 @@ cmd_uninstall() {
     addr=$(head -c 100 -- "$ADDRESS_FILE" | head -n 1)
     is_address "$addr" || addr=""
   fi
+  # Read now: the state file is removed before the account is considered.
+  # A state file from before ACCOUNT_CREATED was recorded counts as "no":
+  # those installers set no account comment that could tell their account
+  # apart from one made by hand, so the account is kept.
+  local account_created=no account_why="this installer did not create it"
   if [[ -f "$STATE_FILE" ]]; then
     local recorded
     recorded=$(sed -n 's/^NODE_ADDRESS=//p' "$STATE_FILE" | head -n 1)
     if is_address "$recorded"; then addr="$recorded"; fi
+    recorded=$(sed -n 's/^ACCOUNT_CREATED=//p' "$STATE_FILE" | head -n 1)
+    if [[ "$recorded" == "yes" ]]; then
+      account_created=yes
+    elif [[ -z "$recorded" ]]; then
+      account_why="this install predates the installer's record of who created it"
+    fi
+  elif account_marker_matches; then
+    account_created=yes
   fi
   local unit_load unit_existed=0 strays
   unit_load=$(systemctl show -p LoadState --value "$UNIT_NAME" 2>/dev/null || true)
@@ -1857,6 +1948,11 @@ cmd_uninstall() {
   say "This removes: the $UNIT_NAME service, $OPT_DIR, $PATH_LINK, $ETC_DIR and $SELF_PATH."
   if (( OPT_PURGE_KEY == 1 )); then
     say "It also DELETES the node key $KEY_FILE (--purge-key)."
+    if [[ "$account_created" == "yes" ]] && id -u "$SERVICE_USER" >/dev/null 2>&1; then
+      say "It also deletes the $SERVICE_USER system user, which this installer created."
+    elif id -u "$SERVICE_USER" >/dev/null 2>&1; then
+      say "It keeps the $SERVICE_USER system user: $account_why."
+    fi
   else
     say "It keeps the node key $KEY_FILE (a later install reuses it)."
   fi
@@ -1920,16 +2016,23 @@ cmd_uninstall() {
     # rm -r removes links without following them.
     rm -rf "$DATA_DIR"
     say "Deleted the node key and $DATA_DIR."
-    if id -u "$SERVICE_USER" >/dev/null 2>&1; then
+    if id -u "$SERVICE_USER" >/dev/null 2>&1 && [[ "$account_created" == "yes" ]]; then
       if err=$(userdel "$SERVICE_USER" 2>&1); then
         say "Deleted the $SERVICE_USER user."
       else
         warn "Could not delete the $SERVICE_USER user (userdel: ${err:0:200}). A process may still be running as it: check with 'ps -u $SERVICE_USER', then run 'sudo userdel $SERVICE_USER'."
         incomplete=1
       fi
+    elif id -u "$SERVICE_USER" >/dev/null 2>&1; then
+      say "Kept the $SERVICE_USER user: $account_why. If nothing else uses it, remove it with 'sudo userdel $SERVICE_USER'."
     fi
   elif [[ -e "$KEY_FILE" ]]; then
     say "Kept the node key at $KEY_FILE (and the $SERVICE_USER user that owns it)."
+  fi
+  # The state file is gone now; the marker carries "this installer created
+  # the account" to the next install, which reuses the kept key and account.
+  if (( OPT_PURGE_KEY == 0 )) && [[ "$account_created" == "yes" ]]; then
+    write_account_marker
   fi
 
   say ""
@@ -2079,6 +2182,11 @@ main() {
   trap cleanup EXIT
   trap on_signal INT TERM HUP
   parse_args "$@"
+  # status only reads, so it still works while another command runs.
+  if [[ "$COMMAND" != "status" ]]; then
+    require_root
+    take_lock
+  fi
   case "$COMMAND" in
     install) cmd_install ;;
     resume) cmd_resume ;;

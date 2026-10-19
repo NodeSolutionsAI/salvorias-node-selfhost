@@ -117,8 +117,12 @@ sudo bash install.sh --owner 0xYourLicenseWalletAddress --wait-minutes 60
 | `sudo salvorias-selfhost upgrade [--version vX]` | Download and verify a newer node release, switch to it, restart. If the service is not running steadily after 30 seconds, or you press Ctrl-C while it watches, it switches back to the previous version. Also updates `salvorias-selfhost` itself. With the binary already current, it restarts a stopped service, and it brings an install made by an older installer to the current file layout. |
 | `sudo salvorias-selfhost upgrade --rollback` | Switch back to the version kept by the last upgrade, restart and watch it. Run it again to go forward. |
 | `sudo salvorias-selfhost backup-key [--out PATH]` | Copy the node key to a root-only file (mode 0600) for offline storage. It never prints the key. |
-| `sudo salvorias-selfhost uninstall [--yes] [--purge-key]` | Remove the service, binary and config. The node key is **kept** unless you pass `--purge-key` and type the confirmation. |
+| `sudo salvorias-selfhost uninstall [--yes] [--purge-key]` | Remove the service, binary and config. The node key is **kept** unless you pass `--purge-key` and type the confirmation. `--purge-key` also deletes the `salvorias` user, but only if the installer created it. |
 | `sudo journalctl -u salvorias-node -f` | Follow the node's log |
+
+Only one command that changes the server runs at a time. Each takes a lock
+(`/run/salvorias-selfhost.lock`); a second one started meanwhile stops with
+exit code 4 and changes nothing. `status` only reads, so it runs any time.
 
 After `uninstall`, your license slot still points at the node on-chain. To
 use that slot for something else (for example Save Hosting), clear it in the
@@ -199,7 +203,10 @@ It logs to journald as `salvorias-node`.
 If a `salvorias` account already exists, the installer uses it only if it
 looks like the system account it would create itself: a system UID, its own
 `salvorias` group with no other members, a `nologin` or `false` shell, and no
-real home directory. Otherwise it stops and says why.
+real home directory. Otherwise it stops and says why. An account the
+installer did not create is never deleted: `uninstall --purge-key` keeps it
+and says so. This includes installs made before the installer recorded who
+created the account.
 
 ## Configuration
 
@@ -267,6 +274,7 @@ Exit codes:
 | 1 | Error |
 | 2 | Bad usage or input |
 | 3 | Stopped: something to do outside the server (no license, no free slot, not registered yet) |
+| 4 | Another `salvorias-selfhost` command is running on this server |
 | 130 | Interrupted |
 
 ## Troubleshooting
