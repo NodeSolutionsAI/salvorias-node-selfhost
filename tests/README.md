@@ -108,10 +108,16 @@ messages, files, owners and modes.
   - `slot-info --node` against https://testnet.salvorias.net itself
     (read-only) succeeds;
   - a full install through a mock that is faithful to that contract: the
-    pre-check passes, and the registration is found by the slot scan. It runs
+    pre-check passes, and the registration is found by the slot scan (the
+    slot is checked in slot-info's JSON; the installer never prints it). It runs
     with a clean `salvorias` system account made beforehand: the state file
     records it as not the installer's, and `uninstall --purge-key` keeps it
     (same UID) and says so.
+- **No free slot** (a mock answering an empty `findOpenSlots` for two
+  licenses): the install does not stop. It reaches the registration wait,
+  the box carries the "All your licenses already have a node" notice and the
+  testnet portal link, no slot number is printed, and a purge leaves the
+  server clean.
 - **A licensed owner, simulated through `tests/mock-rpc.py`**
   (explained in the next section):
   - a piped install from a local release, run from a directory holding a

@@ -41,9 +41,11 @@ WORK="$(mktemp -d /root/selfhost-e2e.XXXXXX)"
 OUT="$WORK/logs"
 MOCK_STATE="$WORK/mock"
 FAITHFUL_STATE="$WORK/mock-faithful"
+FULL_STATE="$WORK/mock-full"
 MOCK_RPC="http://127.0.0.1:8545"
 FAITHFUL_RPC="http://127.0.0.1:8549"
-mkdir -p "$OUT" "$MOCK_STATE" "$FAITHFUL_STATE"
+FULL_RPC="http://127.0.0.1:8550"
+mkdir -p "$OUT" "$MOCK_STATE" "$FAITHFUL_STATE" "$FULL_STATE"
 
 PASS=0
 FAIL=0
@@ -215,6 +217,11 @@ python3 "$E2E_DIR/tests/mock-rpc.py" --listen 127.0.0.1:8549 --upstream "$TESTNE
   --checkin "$TESTNET_CHECKIN" --nft "$TESTNET_NFT" --owner "$OWNER" \
   --licenses 2 --open-slots 0,1 --bound-slot 1 --state-dir "$FAITHFUL_STATE" &
 PIDS+=($!)
+# Same licensed owner with no free slot: every license already has a node.
+python3 "$E2E_DIR/tests/mock-rpc.py" --listen 127.0.0.1:8550 --upstream "$TESTNET_RPC" \
+  --checkin "$TESTNET_CHECKIN" --nft "$TESTNET_NFT" --owner "$OWNER" \
+  --licenses 2 --open-slots "" --bound-slot 1 --state-dir "$FULL_STATE" &
+PIDS+=($!)
 sleep 2
 
 # ─── 1. Usage, preflight and input checks (real testnet) ──────────────────
@@ -365,10 +372,12 @@ expect_rc 0 "a full install against the testnet contract shape completes"
 expect_log faithful 'Using the existing system user salvorias. This installer did not create it' "the pre-made account is used, and named as not the installer's"
 expect_true "state records the account as not created by the installer" grep -qx 'ACCOUNT_CREATED=no' /etc/salvorias/selfhost.conf
 expect_no_log faithful 'Could not read node registration data' "the slot-info --node pre-check passes"
-expect_log faithful 'Registered: node .* \(slot 1\)' "registration found through the slot scan"
+expect_log faithful 'Registered: node .* is bound to ' "registration found through the slot scan"
+expect_no_log faithful '\(slot [0-9]' "the registration line names no slot number"
 FNODE="$(cat "$DATA/node-address.txt")"
 run slot-info-scan "$BIN" slot-info --rpc-url "$FAITHFUL_RPC" --contract "$TESTNET_CHECKIN" --owner "$OWNER" --node "$FNODE"
 expect_log slot-info-scan '"boundSlotSource":"scan"' "slot came from the scan"
+expect_log slot-info-scan '"boundSlot":1[,}]' "the scan found the bound slot"
 run faithful-purge with_tty "uninstall
 delete node key
 " "$SELF uninstall --purge-key"
@@ -382,6 +391,25 @@ userdel salvorias
 rm -f "$FAITHFUL_STATE/bound-node"
 expect_true "server clean again" nothing_installed
 
+section "4c. no free slot: the install goes ahead and says the app will ask which node to replace"
+# Licenses are held but every one already has a node. The installer no longer
+# stops here; the app picks the node to replace and asks the owner to confirm.
+run full-slots env SALVORIAS_POLL_SECONDS=10 bash "$INSTALL" --network testnet --rpc-url "$FULL_RPC" --binary "$BIN" --owner "$OWNER" --wait-minutes 1
+expect_rc 3 "with no free slot the install continues to the registration wait (which times out)"
+expect_no_log full-slots 'STOPPED: All' "no stop for a full set of licenses"
+expect_log full-slots 'Licenses held: 2' "the license count is shown"
+expect_log full-slots 'REGISTER THIS NODE IN THE SALVORIAS APP' "registration box printed"
+expect_log full-slots 'All your licenses already have a node\. When you register, the app' "the replace notice is printed"
+expect_log full-slots 'will tell you which node this replaces and ask you to confirm\.' "the replace notice is complete"
+expect_log full-slots 'Open https://app\.dev\.salvorias\.com/licenses/self-host$' "the testnet portal link is printed"
+expect_no_log full-slots '[Ss]lot\(s\)|[Ff]ree slot|\(slot [0-9]|Slot: ' "no slot numbers shown"
+expect_true "state is awaiting-registration" grep -q '^STAGE=awaiting-registration$' /etc/salvorias/selfhost.conf
+run full-slots-purge with_tty "uninstall
+delete node key
+" "$SELF uninstall --purge-key"
+expect_rc 0 "purge after the no-free-slot install"
+expect_true "server clean after the no-free-slot install" nothing_installed
+
 # ─── 5. Licensed owner via the mock RPC ───────────────────────────────────
 
 section "5. piped install from the release, with a file named main in the cwd; registration wait times out"
@@ -392,8 +420,10 @@ mkdir -p "$WORK/cwd"
 run piped-timeout bash -c "cd $WORK/cwd && cat $INSTALL | SALVORIAS_POLL_SECONDS=10 SALVORIAS_RELEASE_BASE_URL=http://127.0.0.1:8000 bash -s -- --network testnet --rpc-url $MOCK_RPC --owner $OWNER --wait-minutes 1"
 expect_rc 3 "registration wait times out with exit 3"
 expect_log piped-timeout 'REGISTER THIS NODE IN THE SALVORIAS APP' "registration box printed"
-expect_log piped-timeout 'Free slot\(s\) on your license: 0, 1' "free slots listed"
-expect_log piped-timeout 'Licenses > Self Setup, paste this node' "app instruction printed"
+expect_no_log piped-timeout '[Ss]lot\(s\)|[Ff]ree slot|\(slot [0-9]|Slot: ' "no slot numbers shown"
+expect_no_log piped-timeout 'All your licenses already have a node' "no replace notice while a license is free"
+expect_log piped-timeout 'Open https://app\.dev\.salvorias\.com/licenses/self-host$' "the testnet portal link is printed"
+expect_log piped-timeout 'Licenses > Self Setup\), paste this node address' "app instruction printed"
 expect_log piped-timeout 'Keep at least .* SAVDR on the node \(the per-check-in reserve' "funding text names the reserve"
 expect_log piped-timeout 'Suggested for about 90 days: .* SAVDR' "90-day suggestion printed"
 expect_log piped-timeout 'sudo salvorias-selfhost resume' "timeout points to salvorias-selfhost resume"
@@ -597,7 +627,7 @@ mv "$WORK/saved-lock" "$LOCK"
 section "11. status (unfunded, then funded through the mock)"
 run status "$SELF" status
 expect_rc 0 "status"
-expect_log status 'registered to the owner, slot 1' "status shows the binding"
+expect_log status 'Binding: +registered to the owner$' "status shows the binding, without a slot number"
 expect_log status 'Reserve per check-in: .* \(actual fees are lower\)' "status names the reserve"
 expect_log status 'Last 20 log lines' "status shows the journal"
 printf '1000000000000000000\n' >"$MOCK_STATE/balance-wei"
@@ -762,7 +792,8 @@ printf 'e2e: not a key\n' >"$DATA/.stage.e2ekeep/node-key.txt"
 run uninstall-keep "$SELF" uninstall --yes
 expect_rc 0 "uninstall --yes"
 expect_true "a staging directory left in $DATA is removed" test ! -e "$DATA/.stage.e2ekeep"
-expect_log uninstall-keep 'clear it in the Salvorias app' "slot reminder"
+expect_log uninstall-keep 'that license still points at it on-chain' "license reminder"
+expect_log uninstall-keep 'Registering another node in the Salvorias app \(Licenses > Self Setup\) replaces it' "says how to reuse the license"
 expect_true "service, config, binaries and salvorias-selfhost removed" \
   bash -c '[[ ! -e /etc/systemd/system/salvorias-node.service && ! -e /etc/salvorias && ! -e /opt/salvorias && ! -e /usr/local/bin/salvorias-node && ! -e /usr/local/sbin/salvorias-selfhost ]]'
 expect_stat "$DATA/node-key.txt" "600 salvorias:salvorias"
@@ -900,7 +931,12 @@ expect_true "leftover temp files removed" \
   test ! -e /usr/local/sbin/.salvorias-selfhost.e2eXYZ -a ! -e /etc/systemd/system/.salvorias-node.service.e2eXYZ
 expect_true "server clean" nothing_installed
 
-section "19. no transactions, no key in any output"
+section "19. no transactions, no key in any output, no slot number in installer output"
+# The phrases the installer used to print slot numbers with. slot-info-* logs
+# are the binary's raw JSON, not installer output, and the journal excerpts in
+# status carry the daemon's own lines, which the patterns are kept off.
+slot_hits=$(grep -lE 'Free slot|^ *Slot: +[0-9]|registered to the owner, slot|to this wallet \(slot|is bound to .*\(slot [0-9]' "$OUT"/*.log | grep -v '/slot-info-' || true)
+expect_true "no installer output names a slot number${slot_hits:+ (found in: $slot_hits)}" test -z "$slot_hits"
 blocked=$(grep -c '^BLOCKED' "$MOCK_STATE/mock-rpc.log" || true)
 mocked=$(grep -c '^MOCKED' "$MOCK_STATE/mock-rpc.log" || true)
 faithful_blocked=$(grep -c '^BLOCKED' "$FAITHFUL_STATE/mock-rpc.log" || true)

@@ -84,8 +84,8 @@ say() { printf '%s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit "$EXIT_ERROR"; }
 usage_error() { printf 'ERROR: %s\n' "$*" >&2; printf 'Run with --help for usage.\n' >&2; exit "$EXIT_USAGE"; }
-# A precondition outside this server is not met (no license, no free slot,
-# not registered yet). Nothing is broken; the user has something to do.
+# A precondition outside this server is not met (no license, not registered
+# yet). Nothing is broken; the user has something to do.
 stop() { printf '\nSTOPPED: %s\n' "$*" >&2; exit "$EXIT_STOPPED"; }
 banner() { printf '\n=== %s ===\n' "$*"; }
 rule() { printf '%s\n' "========================================================================"; }
@@ -145,8 +145,8 @@ ENVIRONMENT
 
 EXIT CODES
   0 ok   1 error   2 bad usage or input   3 stopped: something to do outside
-  this server (no license, no free slot, not registered yet)   4 another
-  salvorias-selfhost command is running   130 interrupted
+  this server (no license, not registered yet)   4 another salvorias-selfhost
+  command is running   130 interrupted
 EOF
 }
 
@@ -161,6 +161,7 @@ set_network() {
       NET_CHECKIN="0x88ac542c7B8a2952f704B0ed24CFC17F64527D8D"
       NET_NFT="0xc01E4070A3BBBe79b03bB4b11479C5D39aFE1E87"
       NET_TREASURY="0xDEfad8fE8Af1ef0B8d0D00251A80391c9Ed04243"
+      NET_APP_URL="https://app.salvorias.com"
       ;;
     testnet)
       NET_RPC_URL="https://testnet.salvorias.net"
@@ -168,6 +169,9 @@ set_network() {
       NET_CHECKIN="0x51F6122C6014866Bd9443E21b05033b195A1fF27"
       NET_NFT="0xa1CF5786c6ceC9E8D0BbACEdF2cc98dAe4614363"
       NET_TREASURY="0x7e8ecebF965dE86fDE7Ebc7F3020813d656CF723"
+      # The dev portal is the one built for chain 7283 (its bundle points at
+      # testnet.salvorias.net); the production portal only knows mainnet.
+      NET_APP_URL="https://app.dev.salvorias.com"
       ;;
     *)
       usage_error "Unknown network '$1'. Use mainnet or testnet."
@@ -1219,14 +1223,13 @@ ensure_node_key() {
 
 # ─── Registration and funding ──────────────────────────────────────────────
 
-# Sets BOUND_STATE (unbound, owner, other) and BOUND_SLOT from SLOT_JSON.
+# Sets BOUND_STATE (unbound, owner, other) from SLOT_JSON. The slot number is
+# deliberately not kept: nothing shown to the user names a slot.
 BOUND_STATE=""
-BOUND_SLOT=""
 BOUND_OTHER=""
 read_binding() {
   local bound
   bound=$(json_str boundOwner)
-  BOUND_SLOT=$(json_raw boundSlot)
   if [[ -z "$bound" ]]; then
     BOUND_STATE="unbound"
   elif [[ "$(lower "$bound")" == "$(lower "$OWNER")" ]]; then
@@ -1269,6 +1272,9 @@ print_funding() {
   say "   Current node balance: $(wei_to_savdr "$balance") SAVDR"
 }
 
+# print_registration_box OPEN_SLOTS: OPEN_SLOTS is slot-info's openSlots list.
+# Slot numbers are never shown: the app picks the slot itself. The list only
+# decides whether to say that registering will replace an existing node.
 print_registration_box() {
   local slots="$1"
   say ""
@@ -1280,10 +1286,14 @@ print_registration_box() {
   say ""
   say "     $NODE_ADDRESS"
   say ""
-  say "   Free slot(s) on your license: ${slots//,/, }"
-  say ""
-  say "   Open the Salvorias app > Licenses > Self Setup, paste this node"
-  say "   address, choose a free slot, confirm with your passcode."
+  say "   Open $NET_APP_URL/licenses/self-host"
+  say "   (or Salvorias app > Licenses > Self Setup), paste this node address"
+  say "   and confirm with your passcode."
+  if [[ -z "$slots" ]]; then
+    say ""
+    say "   All your licenses already have a node. When you register, the app"
+    say "   will tell you which node this replaces and ask you to confirm."
+  fi
   say ""
   rule
   say " STEP 2: FUND THE NODE"
@@ -1309,7 +1319,7 @@ wait_for_binding() {
       read_binding
       case "$BOUND_STATE" in
         owner)
-          say "Registered: node $NODE_ADDRESS is bound to $OWNER (slot $BOUND_SLOT)."
+          say "Registered: node $NODE_ADDRESS is bound to $OWNER."
           INTERRUPT_HINT=""
           return 0
           ;;
@@ -1477,12 +1487,11 @@ cmd_install() {
   if (( licenses == 0 )); then
     stop "Wallet $OWNER holds no Salvorias node license on $NETWORK. Check that you entered the wallet that owns your license (the one in your Salvorias app). Nothing was installed."
   fi
+  # With every license already holding a node the install still goes ahead:
+  # the app chooses which node the registration replaces and asks the owner
+  # to confirm (print_registration_box says so).
   if [[ "$BOUND_STATE" == "owner" ]]; then
-    say "Node $NODE_ADDRESS is already registered to this wallet (slot $BOUND_SLOT); no new registration needed."
-  elif [[ -z "$slots" ]]; then
-    stop "All $licenses license slot(s) for $OWNER are already in use (for example by Save Hosting). Self-hosting only uses a FREE slot. Free one in the app (Licenses), then run this again. Nothing was installed."
-  else
-    say "Free slot(s): ${slots//,/, }"
+    say "Node $NODE_ADDRESS is already registered to this wallet; no new registration needed."
   fi
 
   # The funding box and the registration wait both depend on slot-info
@@ -1564,7 +1573,6 @@ finalize_install() {
   say "  Network:   $NETWORK (chain $NET_CHAIN_ID)"
   say "  Node:      $NODE_ADDRESS"
   say "  Owner:     $OWNER"
-  say "  Slot:      ${BOUND_SLOT:-unknown}"
   say "  Version:   $(current_version_name)"
   say "  Service:   $(systemctl is-active "$UNIT_NAME" 2>/dev/null || true) ($UNIT_NAME, enabled at boot)"
   say "  Key file:  $KEY_FILE"
@@ -1640,7 +1648,7 @@ cmd_status() {
   if run_slot_info "$PATH_LINK" "$NODE_ADDRESS"; then
     read_binding
     case "$BOUND_STATE" in
-      owner) say "  Binding:   registered to the owner, slot $BOUND_SLOT" ;;
+      owner) say "  Binding:   registered to the owner" ;;
       other) say "  Binding:   REGISTERED TO A DIFFERENT WALLET ($BOUND_OTHER)" ;;
       *) say "  Binding:   NOT REGISTERED (app > Licenses > Self Setup, paste the node address)" ;;
     esac
@@ -2050,11 +2058,11 @@ cmd_uninstall() {
 
   say ""
   if [[ -n "$addr" ]]; then
-    say "If node $addr was registered to a license slot, that slot still points at it on-chain."
+    say "If node $addr was registered to one of your licenses, that license still points at it on-chain."
   else
-    say "If the node was registered to a license slot, that slot still points at it on-chain."
+    say "If the node was registered to one of your licenses, that license still points at it on-chain."
   fi
-  say "To use the slot for another node, clear it in the Salvorias app (Licenses)."
+  say "Registering another node in the Salvorias app (Licenses > Self Setup) replaces it."
 
   # Last, so the steps above can still be retried with it if anything failed.
   if (( incomplete == 1 )); then
