@@ -330,6 +330,9 @@ UPGRADE_PLACED_NEW=0
 # Staged key copies are shredded, not just unlinked.
 cleanup() {
   local d
+  if [[ -n "$BACKUP_TMP" && -f "$BACKUP_TMP" && ! -L "$BACKUP_TMP" ]]; then
+    shred -u -- "$BACKUP_TMP" 2>/dev/null || rm -f -- "$BACKUP_TMP"
+  fi
   for d in "$TMP_DIR" "$DATA_STAGE"; do
     if [[ -n "$d" && -d "$d" && ! -L "$d" ]]; then
       find "$d" -type f \( -name 'key-*' -o -name 'node-key.txt' \) -exec shred -u {} + 2>/dev/null || true
@@ -512,6 +515,9 @@ download_verified() {
 
 STAGED_BIN=""
 STAGED_VERSION=""
+# The version becomes a directory name under /opt/salvorias/bin, so it must
+# start with a letter or digit: never ".", "..", a dot file or an option.
+VERSION_LINE_SED='s/^salvorias-node v\([0-9A-Za-z][0-9A-Za-z._+-]\{0,63\}\)$/\1/p'
 
 # Puts a runnable, verified binary in the temp dir and reads its version.
 stage_binary() {
@@ -533,7 +539,7 @@ stage_binary() {
   if (( rc != 0 )); then
     die "The node binary does not run on this server (exit $rc: ${out:0:200}). Check it matches this CPU ($ASSET_ARCH). If ${TMPDIR:-/tmp} is mounted noexec, rerun with TMPDIR set to a directory that allows execution."
   fi
-  STAGED_VERSION=$(printf '%s\n' "$out" | sed -n 's/^salvorias-node v\([0-9A-Za-z._+-]\{1,64\}\)$/\1/p' | head -n 1)
+  STAGED_VERSION=$(printf '%s\n' "$out" | sed -n "$VERSION_LINE_SED" | head -n 1)
   [[ -n "$STAGED_VERSION" ]] || die "Unexpected output from 'salvorias-node version': ${out:0:200}"
   say "Node binary version: $STAGED_VERSION"
 }
@@ -550,7 +556,10 @@ place_binary() {
   local sha name
   sha=$(file_sha "$STAGED_BIN")
   name="$STAGED_VERSION"
-  case "$name" in current|previous) die "The node binary reports the version '$name', which is reserved here." ;; esac
+  case "$name" in
+    current|previous) die "The node binary reports the version '$name', which is reserved here." ;;
+    .*|*/*) die "The node binary reports the version '$name', which cannot be used as a directory name." ;;
+  esac
   if [[ -e "$BIN_ROOT/$name/salvorias-node" && "$(file_sha "$BIN_ROOT/$name/salvorias-node")" != "$sha" ]]; then
     name="$STAGED_VERSION-${sha:0:12}"
   fi
@@ -836,19 +845,27 @@ guard_single_node() {
 
 # ─── System user and directories ───────────────────────────────────────────
 
-# The service runs as salvorias, which can read the node key. An account of
-# that name that this installer did not create could be a login account, or
-# share its group with people, so an existing one is used only if it looks
-# exactly like the account `useradd --system` makes below. Read-only.
+# The service runs as salvorias, which can read the node key (and its group
+# can read the data directory and node.env). An account of that name that
+# this installer did not create could be a login account, belong to other
+# groups, or share its group with other accounts, so an existing one is used
+# only if it looks exactly like the account `useradd --system --user-group`
+# makes below: a system UID, its own system group as its only group, and no
+# other account in that group. Read-only.
 check_existing_user() {
-  local entry group_entry uid_min shell problems=()
+  local entry group_entry uid_min gid_min shell groups others problems=()
   local -a pw gr
   entry=$(getent passwd "$SERVICE_USER") || return 0
   IFS=: read -r -a pw <<<"$entry"
   uid_min=$(awk '$1 == "UID_MIN" { print $2; exit }' /etc/login.defs 2>/dev/null || true)
   is_uint "$uid_min" || uid_min=1000
+  gid_min=$(awk '$1 == "GID_MIN" { print $2; exit }' /etc/login.defs 2>/dev/null || true)
+  is_uint "$gid_min" || gid_min=1000
   if ! is_uint "${pw[2]:-}" || (( pw[2] == 0 || pw[2] >= uid_min )); then
     problems+=("UID ${pw[2]:-?} is not a system UID (1 to $((uid_min - 1)))")
+  fi
+  if ! is_uint "${pw[3]:-}" || (( pw[3] == 0 || pw[3] >= gid_min )); then
+    problems+=("its primary GID ${pw[3]:-?} is not a system GID (1 to $((gid_min - 1)))")
   fi
   if group_entry=$(getent group "$SERVICE_USER"); then
     IFS=: read -r -a gr <<<"$group_entry"
@@ -856,6 +873,16 @@ check_existing_user() {
     [[ -z "${gr[3]:-}" ]] || problems+=("the '$SERVICE_USER' group has other members (${gr[3]})")
   else
     problems+=("there is no group named '$SERVICE_USER'")
+  fi
+  groups=$(id -Gn -- "$SERVICE_USER" 2>/dev/null || true)
+  if [[ "$groups" != "$SERVICE_USER" ]]; then
+    problems+=("it belongs to other groups (${groups:-unknown}); it must be in '$SERVICE_USER' only")
+  fi
+  # Accounts whose primary group is this GID share the group without being
+  # listed as members, so the group entry alone does not show them.
+  if is_uint "${pw[3]:-}"; then
+    others=$(awk -F: -v g="${pw[3]}" -v u="$SERVICE_USER" '$4 == g && $1 != u { printf "%s ", $1 }' /etc/passwd 2>/dev/null || true)
+    [[ -z "$others" ]] || problems+=("other accounts have the '$SERVICE_USER' group as their primary group (${others% })")
   fi
   shell="${pw[6]:-}"
   case "$shell" in
@@ -923,7 +950,11 @@ require_data_file() {
   if [[ -L "$1" || ! -f "$1" ]]; then
     die "$1 is not a regular file (it may be a symbolic link). Refusing to touch it or follow it. Inspect it, and remove it if it is not yours."
   fi
-  [[ "$(stat -c '%h' -- "$1")" == 1 ]] || die "$1 has other hard links. Refusing to touch it. Inspect it, then rerun."
+  local links
+  links=$(stat -c '%h' -- "$1")
+  if [[ "$links" != 1 ]]; then
+    die "$1 has another hard link (link count $links): some other path on this server is the same file, so writing, moving or shredding it here would affect that path too. Refusing to touch it. Find the other link with 'sudo find / -xdev -samefile $1', inspect it, remove the extra link if it is not yours, then rerun."
+  fi
 }
 
 # place_data_file STAGED DEST OWNER MODE: sets the owner and mode on a file in
@@ -959,22 +990,40 @@ KEY_FORMAT_MSG="--import-key file must contain exactly one node key (64 hex char
 # Reads the --import-key file exactly ONCE, into a root-only staging copy in
 # the fresh 0700 temp dir, and does every later step (validation, address,
 # install) from that copy, so the source cannot be swapped between the check
-# and the use. dd's iflag=nofollow refuses a link even if one replaces the
-# file after the -L test. The contents are never printed.
+# and the use. The checks are made on the path (lstat); the copy is read
+# from a descriptor whose file is compared (fstat, before and after the read)
+# with what was checked, so a link, another file or a mode change slipped in
+# after the checks is refused. The read runs under a timeout, so a FIFO
+# swapped in cannot hang the install. The contents are never printed.
 IMPORT_STAGED=""
 stage_import_key() {
-  local f="$1" mode size line
+  local f="$1" mode size line checked opened
   [[ ! -L "$f" ]] || usage_error "--import-key $f is a symbolic link. Pass the key file itself."
   [[ -f "$f" ]] || usage_error "--import-key file not found (or not a regular file): $f"
   [[ "$(cd "$(dirname "$f")" && pwd)/$(basename "$f")" != "$KEY_FILE" ]] || usage_error "--import-key cannot be the installed key file itself."
+  # device:inode:type+mode (raw hex):owner
+  checked=$(stat -c '%d:%i:%f:%u' -- "$f")
   mode=$(stat -c '%a' -- "$f")
   if (( (8#$mode & 8#044) != 0 )); then
     usage_error "--import-key file $f is readable by other users (mode $mode). A node key must be private: run 'sudo chmod 600 $f' and try again."
   fi
   make_tmp_dir
   IMPORT_STAGED="$TMP_DIR/key-import"
-  ( umask 077; timeout 10 dd if="$f" of="$IMPORT_STAGED" iflag=nofollow bs=4096 count=1 status=none ) \
+  # stat -L on /proc/self/fd/3 is an fstat of the descriptor the copy is
+  # read from (the stat process inherits it).
+  # shellcheck disable=SC2016
+  opened=$(umask 077; timeout 10 bash -c '
+      exec 3<"$1" || exit 1
+      stat -L -c "%d:%i:%f:%u" /proc/self/fd/3 || exit 1
+      dd of="$2" bs=4096 count=1 status=none <&3 || exit 1
+      stat -L -c "%d:%i:%f:%u" /proc/self/fd/3' _ "$f" "$IMPORT_STAGED" 2>/dev/null) \
     || usage_error "Could not read the --import-key file $f (it must be a regular file, not a link)."
+  if [[ "$opened" != "$checked"$'\n'"$checked" ]]; then
+    usage_error "The --import-key file $f changed while it was being read (a different file, a link, or a new owner or mode). Nothing was installed. Check the file, then try again."
+  fi
+  if [[ -L "$IMPORT_STAGED" || ! -f "$IMPORT_STAGED" || "$(stat -c '%u:%a:%h' -- "$IMPORT_STAGED")" != "0:600:1" ]]; then
+    die "The staged copy of the --import-key file is not a private root-owned file. Nothing was installed."
+  fi
   size=$(stat -c '%s' -- "$IMPORT_STAGED")
   (( size >= 64 && size <= 67 )) || usage_error "$KEY_FORMAT_MSG"
   line=""
@@ -1219,8 +1268,14 @@ EOF
   mv -f "$tmp" "$ENV_FILE"
 }
 
+# Writes the unit file, but replaces the installed one only if the content
+# differs: rewriting an identical file still changes it on disk, and systemd
+# then warns that the loaded unit is stale. Sets UNIT_CHANGED; the caller runs
+# daemon-reload when it is 1.
+UNIT_CHANGED=0
 write_unit_file() {
   local tmp
+  UNIT_CHANGED=0
   is_safe_repo "$SALVORIAS_RELEASE_REPO" || die "SALVORIAS_RELEASE_REPO is not a GitHub owner/name."
   assert_plain_values "$SERVICE_USER" "$ENV_FILE" "$PATH_LINK"
   tmp=$(mktemp "/etc/systemd/system/.salvorias-node.service.XXXXXX")
@@ -1264,7 +1319,13 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 WantedBy=multi-user.target
 EOF
   chmod 0644 "$tmp"
+  if [[ -f "$UNIT_FILE" && ! -L "$UNIT_FILE" ]] && cmp -s "$tmp" "$UNIT_FILE" \
+      && [[ "$(stat -c '%a %u:%g' -- "$UNIT_FILE")" == "644 0:0" ]]; then
+    rm -f "$tmp"
+    return 0
+  fi
   mv -f "$tmp" "$UNIT_FILE"
+  UNIT_CHANGED=1
 }
 
 # service_stays_up SECONDS: true if the service is active for the whole
@@ -1382,8 +1443,9 @@ finalize_install() {
   banner "Starting the node service"
   write_env_file
   write_unit_file
-  # "starting" until systemd has actually started the service, so a failed
-  # start stays resumable instead of being recorded as installed.
+  # "starting" until the service has started AND stayed up through the
+  # watch below, so a failed start or an early crash stays resumable instead
+  # of being recorded as installed.
   write_state starting
   systemctl daemon-reload
   # enable and start separately: `enable --now` exits 0 even when the start
@@ -1396,10 +1458,13 @@ finalize_install() {
     show_journal 20
     die "The node service could not be started (${err:0:300}). The key and settings are saved, and systemd keeps retrying the service. Fix the problem shown above, then run: $(cmd_hint resume)"
   fi
+  if ! service_stays_up 10; then
+    say ""
+    say "Recent log:"
+    show_journal 20
+    die "The node service started but did not stay up (it stopped or was restarted within 10 seconds). The key and settings are saved, systemd keeps retrying the service, and the install is not marked finished. Fix the problem shown above, then run: $(cmd_hint resume)"
+  fi
   write_state installed
-
-  local healthy=1
-  service_stays_up 10 || healthy=0
 
   # Fresh balance and fee for the summary.
   local balance="" cost=""
@@ -1438,13 +1503,6 @@ finalize_install() {
   say "  sudo journalctl -u salvorias-node -f follow the node's log"
   if [[ ! -x "$SELF_PATH" ]]; then
     say "  ($SELF_PATH could not be installed; use instead: $(cmd_hint '<command>'))"
-  fi
-
-  if (( healthy == 0 )); then
-    say ""
-    say "Recent log:"
-    show_journal 20
-    die "The node service is not staying up. Read the log above, then check: $(cmd_hint status)"
   fi
 }
 
@@ -1600,11 +1658,15 @@ cmd_upgrade() {
 
 # Switches back to UPGRADE_ROLLBACK_TO and removes the directory the
 # interrupted or failed upgrade placed, if it created one.
+# UPGRADE_ROLLBACK_TO is cleared only once the switch back has happened: an
+# interrupt that lands while this runs makes on_signal call it again, and
+# every step is safe to repeat. Cleared any earlier, that interrupt would
+# find nothing to switch back to and leave the failed version current.
 undo_upgrade() {
   local to="$UPGRADE_ROLLBACK_TO"
-  UPGRADE_ROLLBACK_TO=""
   [[ -n "$to" ]] || return 0
   switch_current "$to"
+  UPGRADE_ROLLBACK_TO=""
   systemctl restart "$UNIT_NAME" || true
   if (( UPGRADE_PLACED_NEW == 1 )) && [[ -n "$UPGRADE_PLACED" && "$UPGRADE_PLACED" != "$to" ]]; then
     rm -rf "${BIN_ROOT:?}/$UPGRADE_PLACED"
@@ -1614,18 +1676,13 @@ undo_upgrade() {
 # Brings an install made by an earlier installer version to the current
 # layout: the root-owned data directory and address record, and the unit
 # file without ReadWritePaths. Safe to repeat. Sets UNIT_CHANGED.
-UNIT_CHANGED=0
 repair_layout() {
-  local before
   secure_data_dir
   [[ -e "$KEY_FILE" ]] || die "The node key $KEY_FILE is missing."
   require_data_file "$KEY_FILE"
   write_address_file
-  before=$(file_sha "$UNIT_FILE")
   write_unit_file
-  UNIT_CHANGED=0
-  if [[ "$(file_sha "$UNIT_FILE")" != "$before" ]]; then
-    UNIT_CHANGED=1
+  if (( UNIT_CHANGED == 1 )); then
     systemctl daemon-reload
     say "Updated $UNIT_FILE to the current layout."
   fi
@@ -1684,16 +1741,52 @@ prune_versions() {
 
 # ─── backup-key ────────────────────────────────────────────────────────────
 
+# check_backup_dir DIR: the backup is written as root, so DIR and every
+# directory above it must be root's alone. A directory another user can
+# write to (or a sticky one, for DIR itself) would let them choose or swap
+# what the path points at. Ancestors may be sticky and world-writable (like
+# /tmp): there no one else can rename a root-owned entry.
+check_backup_dir() {
+  local dir real info mode owner
+  real=$(cd -P -- "$1" 2>/dev/null && pwd -P) || die "Cannot resolve the directory $1."
+  dir="$real"
+  while :; do
+    info=$(stat -c '%a %u' -- "$dir") || die "Cannot inspect $dir."
+    mode="${info% *}"
+    owner="${info#* }"
+    if [[ "$owner" != 0 ]]; then
+      die "$dir is not owned by root. Refusing to write the node key backup under it. Use a root-only directory such as /root."
+    fi
+    if [[ "$dir" == "$real" ]]; then
+      if (( (8#$mode & 8#1022) != 0 )); then
+        die "$dir (mode $mode) can be written by users other than root. Refusing to write the node key backup into it. Use a root-only directory such as /root."
+      fi
+    elif (( (8#$mode & 8#022) != 0 && (8#$mode & 8#1000) == 0 )); then
+      die "$dir (mode $mode) can be written by users other than root. Refusing to write the node key backup under it. Use a root-only directory such as /root."
+    fi
+    [[ "$dir" != "/" ]] || break
+    dir=$(dirname -- "$dir")
+  done
+}
+
 # The key is copied once into the root-only temp dir, checked there, and the
 # backup is written from that checked copy.
+BACKUP_TMP=""
 cmd_backup_key() {
   require_root
   secure_data_dir
   [[ -e "$KEY_FILE" || -L "$KEY_FILE" ]] || die "No node key found at $KEY_FILE."
   require_data_file "$KEY_FILE"
   local out="${OPT_OUT:-/root/salvorias-node-key-backup-$(date +%Y%m%d-%H%M%S).txt}"
+  local out_dir out_name
+  out_dir=$(dirname -- "$out")
+  out_name=$(basename -- "$out")
+  case "$out" in */) die "--out must name a file, not a directory: $out" ;; esac
+  case "$out_name" in .|..) die "--out must name a file: $out" ;; esac
   [[ ! -e "$out" && ! -L "$out" ]] || die "$out already exists. Choose another path with --out."
-  [[ -d "$(dirname "$out")" ]] || die "Directory $(dirname "$out") does not exist."
+  [[ ! -L "$out_dir" ]] || die "$out_dir is a symbolic link. Refusing to write the key through it. Pass a path in a real directory."
+  [[ -d "$out_dir" ]] || die "Directory $out_dir does not exist."
+  check_backup_dir "$out_dir"
   make_tmp_dir
   local staged="$TMP_DIR/key-backup" addr=""
   ( umask 077; head -c 4096 -- "$KEY_FILE" >"$staged" ) || die "Could not read $KEY_FILE."
@@ -1703,9 +1796,16 @@ cmd_backup_key() {
   else
     warn "The node binary is not installed, so the key file could not be checked before copying."
   fi
-  ( umask 077; set -o noclobber; cat -- "$staged" >"$out" ) || die "Could not write $out."
-  chown -h root:root "$out"
-  chmod 0600 "$out"
+  # The temp file is created (O_EXCL) and fully set up inside the checked
+  # directory, then renamed into place; nothing touches $out by name after
+  # that, so no later step can follow a link someone put there.
+  BACKUP_TMP=$(umask 077; mktemp -- "$out_dir/.salvorias-key-backup.XXXXXX") || die "Could not create a file in $out_dir."
+  if ! { cat -- "$staged" >"$BACKUP_TMP" && chown root:root -- "$BACKUP_TMP" && chmod 0600 -- "$BACKUP_TMP"; }; then
+    die "Could not write the backup in $out_dir."
+  fi
+  [[ ! -e "$out" && ! -L "$out" ]] || die "$out appeared while the backup was being written. Nothing was written there."
+  mv -T -- "$BACKUP_TMP" "$out" || die "Could not move the backup to $out."
+  BACKUP_TMP=""
 
   banner "Node key backed up"
   say "  File:  $out (mode 0600, root only)"
@@ -1743,7 +1843,12 @@ cmd_uninstall() {
     recorded=$(sed -n 's/^NODE_ADDRESS=//p' "$STATE_FILE" | head -n 1)
     if is_address "$recorded"; then addr="$recorded"; fi
   fi
-  if [[ ! -e "$STATE_FILE" && ! -e "$ENV_FILE" && ! -e "$UNIT_FILE" && ! -e "$OPT_DIR" && ! -e "$KEY_FILE" && ! -e "$SELF_PATH" ]]; then
+  local unit_load unit_existed=0 strays
+  unit_load=$(systemctl show -p LoadState --value "$UNIT_NAME" 2>/dev/null || true)
+  if [[ -e "$UNIT_FILE" || -L "$UNIT_FILE" ]]; then unit_existed=1; fi
+  strays=$(stray_files)
+  if [[ ! -e "$STATE_FILE" && ! -e "$ENV_FILE" && ! -e "$UNIT_FILE" && ! -e "$OPT_DIR" && ! -e "$KEY_FILE" && ! -e "$SELF_PATH" \
+      && "$unit_load" != "loaded" && -z "$strays" ]]; then
     say "Nothing to uninstall: no Salvorias self-host node found on this server."
     return 0
   fi
@@ -1779,16 +1884,33 @@ cmd_uninstall() {
       || { say "Cancelled. Nothing was changed."; exit "$EXIT_ERROR"; }
   fi
 
-  if [[ -f "$UNIT_FILE" ]]; then
-    systemctl disable --now "$UNIT_NAME" >/dev/null 2>&1 || true
-    rm -f "$UNIT_FILE"
-    systemctl daemon-reload
-    systemctl reset-failed "$UNIT_NAME" >/dev/null 2>&1 || true
-    say "Removed the service."
+  # Stopped whether or not the unit file is still there: a unit whose file
+  # was deleted stays loaded (and running) until it is stopped and systemd
+  # is reloaded. Nothing else is removed unless the service really stopped.
+  local state wants="/etc/systemd/system/multi-user.target.wants/$UNIT_NAME" incomplete=0 err
+  systemctl stop "$UNIT_NAME" >/dev/null 2>&1 || true
+  state=$(systemctl is-active "$UNIT_NAME" 2>/dev/null || true)
+  case "$state" in
+    active|activating|deactivating|reloading|refreshing)
+      die "The $UNIT_NAME service is still running (state: $state) after 'systemctl stop'. Nothing was removed. Stop it with 'sudo systemctl stop $UNIT_NAME', check 'sudo systemctl status $UNIT_NAME', then run the uninstall again." ;;
+  esac
+  systemctl disable "$UNIT_NAME" >/dev/null 2>&1 || true
+  # disable cannot find the unit once its file is gone, so remove the boot
+  # link it left behind directly.
+  if [[ -L "$wants" ]]; then rm -f -- "$wants"; fi
+  rm -f -- "$UNIT_FILE"
+  systemctl daemon-reload
+  systemctl reset-failed "$UNIT_NAME" >/dev/null 2>&1 || true
+  if [[ -e "$UNIT_FILE" || -L "$wants" ]]; then
+    warn "Could not remove $UNIT_FILE or $wants."
+    incomplete=1
+  elif (( unit_existed == 1 )) || [[ "$unit_load" == "loaded" ]]; then
+    say "Stopped and removed the service."
   fi
   if [[ -L "$PATH_LINK" ]]; then rm -f "$PATH_LINK"; fi
   rm -rf "$OPT_DIR" "$ETC_DIR"
   say "Removed $OPT_DIR, $PATH_LINK and $ETC_DIR."
+  remove_strays
 
   if (( OPT_PURGE_KEY == 1 )); then
     if [[ -e "$KEY_FILE" ]]; then
@@ -1797,8 +1919,15 @@ cmd_uninstall() {
     fi
     # rm -r removes links without following them.
     rm -rf "$DATA_DIR"
-    if id -u "$SERVICE_USER" >/dev/null 2>&1; then userdel "$SERVICE_USER" >/dev/null 2>&1 || true; fi
-    say "Deleted the node key, $DATA_DIR and the $SERVICE_USER user."
+    say "Deleted the node key and $DATA_DIR."
+    if id -u "$SERVICE_USER" >/dev/null 2>&1; then
+      if err=$(userdel "$SERVICE_USER" 2>&1); then
+        say "Deleted the $SERVICE_USER user."
+      else
+        warn "Could not delete the $SERVICE_USER user (userdel: ${err:0:200}). A process may still be running as it: check with 'ps -u $SERVICE_USER', then run 'sudo userdel $SERVICE_USER'."
+        incomplete=1
+      fi
+    fi
   elif [[ -e "$KEY_FILE" ]]; then
     say "Kept the node key at $KEY_FILE (and the $SERVICE_USER user that owns it)."
   fi
@@ -1812,10 +1941,44 @@ cmd_uninstall() {
   say "To use the slot for another node, clear it in the Salvorias app (Licenses)."
 
   # Last, so the steps above can still be retried with it if anything failed.
+  if (( incomplete == 1 )); then
+    die "The uninstall did not finish: see the warnings above. Fix them, then run: $(cmd_hint uninstall)"
+  fi
   if [[ -e "$SELF_PATH" ]]; then
     rm -f "$SELF_PATH"
     say "Removed $SELF_PATH."
   fi
+}
+
+# Files an interrupted run can leave behind: the temp copies made next to
+# salvorias-selfhost and the unit file before they are renamed into place,
+# and staging directories in DATA_DIR (which can hold a key copy).
+stray_files() {
+  local f
+  for f in /usr/local/sbin/.salvorias-selfhost.* /etc/systemd/system/.salvorias-node.service.* "$DATA_DIR"/.stage.*; do
+    if [[ -e "$f" || -L "$f" ]]; then printf '%s\n' "$f"; fi
+  done
+}
+
+# Removes those leftovers. rm never follows a link. Key copies in a staging
+# directory are shredded first, but only inside a real root-owned directory
+# in a root-owned DATA_DIR: there the service account cannot swap a file for
+# a link between the find and the shred.
+remove_strays() {
+  local f n=0 data_ok=0
+  if [[ -d "$DATA_DIR" && ! -L "$DATA_DIR" && "$(stat -c '%u' -- "$DATA_DIR")" == 0 ]]; then data_ok=1; fi
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    if [[ "$f" == "$DATA_DIR"/* ]]; then
+      (( data_ok == 1 )) || continue
+      if [[ -d "$f" && ! -L "$f" && "$(stat -c '%u' -- "$f")" == 0 ]]; then
+        find "$f" -xdev -type f -links 1 \( -name 'key-*' -o -name 'node-key.txt' \) -exec shred -u {} + 2>/dev/null || true
+      fi
+    fi
+    rm -rf -- "$f"
+    n=$((n + 1))
+  done < <(stray_files)
+  if (( n > 0 )); then say "Removed $n file(s) left by an interrupted run."; fi
 }
 
 # ─── Argument parsing ──────────────────────────────────────────────────────
