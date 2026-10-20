@@ -402,7 +402,9 @@ expect_no_log replaced-reinstall 'Registered: node' "the wait loop does not repo
 rm -f "$FAITHFUL_STATE/replaced-by"
 run replaced-resume env SALVORIAS_POLL_SECONDS=3 "$SELF" resume --wait-minutes 1
 expect_rc 0 "registered again: resume completes"
-expect_log replaced-resume 'Registered: node .* is bound to ' "resume sees the new registration"
+# Registered again before resume ran, so resume skips the box and the wait.
+expect_no_log replaced-resume 'REGISTER THIS NODE IN THE SALVORIAS APP' "resume sees the new registration (no registration box)"
+expect_log replaced-resume '=== Salvorias node installed ===' "resume finishes the install"
 run faithful-purge with_tty "uninstall
 delete node key
 " "$SELF uninstall --purge-key"
