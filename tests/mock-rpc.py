@@ -11,6 +11,11 @@ a license:
   NodeCheckIn.nodeAddressOf(owner, i) -> the bound node at --bound-slot, else
                                      the zero address (the slot-info scan path)
   eth_getBalance(bound node)       -> <state-dir>/balance-wei, if that file exists
+
+<state-dir>/replaced-by plays the app putting another node on the bound
+node's license: nodeAddressOf(owner, --bound-slot) then answers that address,
+while nodeToOwner keeps naming the owner for the bound node (a reverse mapping
+left behind). slot-info's nodeAddressOf scan then reports boundSlot null.
   eth_gasPrice, eth_maxPriorityFeePerGas -> --fee-wei, if given
 
 --fee-wei pins a non-zero fee, so the funding text and the daemon's
@@ -192,6 +197,9 @@ class Mock:
             elif to == self.checkin and sel == SEL_NODE_ADDRESS_OF and arg_address(data, 0) == self.owner:
                 slot = arg_uint(data, 1)
                 node = bound if bound and slot == self.o.bound_slot else "0x" + "0" * 40
+                replaced_by = self.state("replaced-by")
+                if replaced_by and slot == self.o.bound_slot:
+                    node = replaced_by.lower()
                 result = enc_address(node)
         elif method in ("eth_gasPrice", "eth_maxPriorityFeePerGas") and self.o.fee_wei is not None:
             result = hex(self.o.fee_wei)

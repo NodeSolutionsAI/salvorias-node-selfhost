@@ -20,7 +20,11 @@ formatting, whole-number validation (no leading zeros such as `08`, which
 bash arithmetic reads as invalid octal), the funding text (reserve wording and the 90-day suggestion), the
 URL and repo rules, `checksums.txt` parsing (empty file, missing entry,
 `*name` entries, CRLF, conflicting entries), the ELF header check, and the
-version-name pattern (no `..`, leading dot or dash, or slash). One more test
+version-name pattern (no `..`, leading dot or dash, or slash), the
+`openSlots` reader (a missing or malformed list stops the install; only `[]`
+means no free license), the registration rule (the owner named AND a
+license entry found, `boundSlot`), and the scrubbed environment the node
+binary runs with (a stand-in binary prints what it received). One more test
 runs the real `on_signal` and `undo_upgrade` with a slowed `switch_current`
 and interrupts the switch back: the run must still end on the old version.
 
@@ -112,12 +116,21 @@ messages, files, owners and modes.
     slot is checked in slot-info's JSON; the installer never prints it). It runs
     with a clean `salvorias` system account made beforehand: the state file
     records it as not the installer's, and `uninstall --purge-key` keeps it
-    (same UID) and says so.
+    (same UID) and says so;
+  - the app putting another node on that license (`<state-dir>/replaced-by`):
+    `nodeToOwner` still names the owner but no license points at the node.
+    `status` says NOT REGISTERED, and a reinstall with the kept key does not
+    skip the registration: it waits, and finishes once the node is registered
+    again.
 - **No free slot** (a mock answering an empty `findOpenSlots` for two
   licenses): the install does not stop. It reaches the registration wait,
   the box carries the "All your licenses already have a node" notice and the
   testnet portal link, no slot number is printed, and a purge leaves the
-  server clean.
+  server clean. That install runs with stray node settings in its
+  environment (`NFT_CONTRACT`, `CHECKIN_CONTRACT`, `RPC_URL`,
+  `NODE_KEYS_FILE`, `SALVORIAS_NODE_VERSION`). Two control runs of the bare
+  binary show those settings change its output; the installer's results do
+  not change.
 - **A licensed owner, simulated through `tests/mock-rpc.py`**
   (explained in the next section):
   - a piped install from a local release, run from a directory holding a
@@ -208,7 +221,8 @@ against the chain directly. `tests/mock-rpc.py` is a small JSON-RPC proxy:
   the `nodeAddressOf` slot scan) and node balance for the test's owner wallet
   itself. The binding appears when the test writes the node address to
   `<state-dir>/bound-node`, which plays the owner registering the node in the
-  app.
+  app. `<state-dir>/replaced-by` plays the app putting another node on that
+  license afterwards.
 - With `--fee-wei` it pins `eth_gasPrice` and `eth_maxPriorityFeePerGas`, so
   the non-zero fee paths run whatever the testnet fee is that day.
 - It **refuses `eth_sendRawTransaction` and `eth_sendTransaction`**, so

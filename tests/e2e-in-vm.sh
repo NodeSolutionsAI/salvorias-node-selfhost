@@ -378,6 +378,31 @@ FNODE="$(cat "$DATA/node-address.txt")"
 run slot-info-scan "$BIN" slot-info --rpc-url "$FAITHFUL_RPC" --contract "$TESTNET_CHECKIN" --owner "$OWNER" --node "$FNODE"
 expect_log slot-info-scan '"boundSlotSource":"scan"' "slot came from the scan"
 expect_log slot-info-scan '"boundSlot":1[,}]' "the scan found the bound slot"
+# The app puts another node on this node's license. The chain's reverse
+# mapping can still name the owner for this node (nodeToOwner), but no
+# license points at it: that must not count as registered anywhere.
+printf '%s\n' 0x000000000000000000000000000000000000bEEF >"$FAITHFUL_STATE/replaced-by"
+run slot-info-replaced "$BIN" slot-info --rpc-url "$FAITHFUL_RPC" --contract "$TESTNET_CHECKIN" --owner "$OWNER" --node "$FNODE"
+expect_log slot-info-replaced '"nodeBoundToOwner":true' "the mock keeps the stale reverse mapping (nodeToOwner still names the owner)"
+expect_log slot-info-replaced '"boundSlot":null' "slot-info finds no license pointing at the node"
+run replaced-status "$SELF" status
+expect_rc 0 "status with the node replaced"
+expect_log replaced-status 'Binding: +NOT REGISTERED: another node has taken its place' "status says the node is no longer registered"
+expect_no_log replaced-status 'registered to the owner' "status does not call the replaced node registered"
+run replaced-uninstall "$SELF" uninstall --yes
+expect_rc 0 "uninstall (keeps the key) after the node was replaced"
+run replaced-reinstall env SALVORIAS_POLL_SECONDS=5 bash "$INSTALL" --network testnet --rpc-url "$FAITHFUL_RPC" --binary "$BIN" --owner "$OWNER" --wait-minutes 1
+expect_rc 3 "a kept key whose license moved on is not taken as registered: the wait times out"
+expect_log replaced-reinstall 'Found the node key kept by an earlier uninstall' "the kept key is reused"
+expect_log replaced-reinstall 'was registered to this wallet before, but another node has since taken its place' "says the node was replaced"
+expect_no_log replaced-reinstall 'already registered to this wallet' "no 'already registered' skip for a replaced node"
+expect_log replaced-reinstall 'REGISTER THIS NODE IN THE SALVORIAS APP' "registration box printed for the replaced node"
+expect_log replaced-reinstall 'not registered yet' "the wait loop keeps waiting while the node is replaced"
+expect_no_log replaced-reinstall 'Registered: node' "the wait loop does not report a registration"
+rm -f "$FAITHFUL_STATE/replaced-by"
+run replaced-resume env SALVORIAS_POLL_SECONDS=3 "$SELF" resume --wait-minutes 1
+expect_rc 0 "registered again: resume completes"
+expect_log replaced-resume 'Registered: node .* is bound to ' "resume sees the new registration"
 run faithful-purge with_tty "uninstall
 delete node key
 " "$SELF uninstall --purge-key"
@@ -394,13 +419,26 @@ expect_true "server clean again" nothing_installed
 section "4c. no free slot: the install goes ahead and says the app will ask which node to replace"
 # Licenses are held but every one already has a node. The installer no longer
 # stops here; the app picks the node to replace and asks the owner to confirm.
-run full-slots env SALVORIAS_POLL_SECONDS=10 bash "$INSTALL" --network testnet --rpc-url "$FULL_RPC" --binary "$BIN" --owner "$OWNER" --wait-minutes 1
+# This install also runs with node settings left in the caller's environment.
+# The binary reads them (the two control runs show it), so the installer
+# must run it with them removed.
+JUNK_ENV=(NFT_CONTRACT=0x000000000000000000000000000000000000dEaD CHECKIN_CONTRACT=0x000000000000000000000000000000000000dEaD
+  RPC_URL=http://127.0.0.1:9 NODE_KEYS_FILE=/nonexistent/keys SALVORIAS_NODE_VERSION=6.6.6)
+run env-control-slot-info env "${JUNK_ENV[@]}" "$BIN" slot-info --rpc-url "$FULL_RPC" --contract "$TESTNET_CHECKIN" --owner "$OWNER"
+expect_no_log env-control-slot-info "\"nftContract\":\"$TESTNET_NFT\"" "control: a stray NFT_CONTRACT changes an unscrubbed slot-info"
+run env-control-version env "${JUNK_ENV[@]}" "$BIN" version
+expect_log env-control-version 'v6\.6\.6' "control: a stray SALVORIAS_NODE_VERSION changes an unscrubbed version"
+run full-slots env "${JUNK_ENV[@]}" SALVORIAS_POLL_SECONDS=10 bash "$INSTALL" --network testnet --rpc-url "$FULL_RPC" --binary "$BIN" --owner "$OWNER" --wait-minutes 1
 expect_rc 3 "with no free slot the install continues to the registration wait (which times out)"
+expect_no_log full-slots 'counts licenses on NFT contract' "the stray NFT_CONTRACT does not reach slot-info"
+expect_no_log full-slots '6\.6\.6' "the stray SALVORIAS_NODE_VERSION does not reach the version check"
+expect_true "the binary is installed under its real version" test -d "/opt/salvorias/bin/$("$BIN" version | sed -n 's/^salvorias-node v//p')"
 expect_no_log full-slots 'STOPPED: All' "no stop for a full set of licenses"
 expect_log full-slots 'Licenses held: 2' "the license count is shown"
 expect_log full-slots 'REGISTER THIS NODE IN THE SALVORIAS APP' "registration box printed"
-expect_log full-slots 'All your licenses already have a node\. When you register, the app' "the replace notice is printed"
-expect_log full-slots 'will tell you which node this replaces and ask you to confirm\.' "the replace notice is complete"
+expect_log full-slots 'All your licenses already have a node\. When you register, the app$' "the replace notice is printed"
+expect_log full-slots 'tells you which node this replaces, and asks you to confirm before$' "the replace notice continues"
+expect_log full-slots 'moving a node off Save Hosting\.$' "the replace notice is complete"
 expect_log full-slots 'Open https://app\.dev\.salvorias\.com/licenses/self-host$' "the testnet portal link is printed"
 expect_no_log full-slots '[Ss]lot\(s\)|[Ff]ree slot|\(slot [0-9]|Slot: ' "no slot numbers shown"
 expect_true "state is awaiting-registration" grep -q '^STAGE=awaiting-registration$' /etc/salvorias/selfhost.conf
@@ -792,8 +830,13 @@ printf 'e2e: not a key\n' >"$DATA/.stage.e2ekeep/node-key.txt"
 run uninstall-keep "$SELF" uninstall --yes
 expect_rc 0 "uninstall --yes"
 expect_true "a staging directory left in $DATA is removed" test ! -e "$DATA/.stage.e2ekeep"
-expect_log uninstall-keep 'that license still points at it on-chain' "license reminder"
-expect_log uninstall-keep 'Registering another node in the Salvorias app \(Licenses > Self Setup\) replaces it' "says how to reuse the license"
+expect_log uninstall-keep 'that license keeps pointing at it\.$' "license reminder"
+expect_log uninstall-keep 'To move this node to another server, copy its key here with:' "says how to move the node"
+expect_log uninstall-keep 'install\.sh \| sudo bash -s -- backup-key$' "the backup-key hint does not name the removed salvorias-selfhost"
+expect_log uninstall-keep 'then install there with --import-key and that file\. No new registration is needed\.' "points at --import-key"
+expect_log uninstall-keep 'If you register a different node instead, the app may replace this node or, if all$' "says what a new registration may replace"
+expect_log uninstall-keep 'your licenses are busy, a Save Hosting node, after asking you\.$' "names the Save Hosting case"
+expect_no_log uninstall-keep 'replaces it\.' "the old 'replaces it' wording is gone"
 expect_true "service, config, binaries and salvorias-selfhost removed" \
   bash -c '[[ ! -e /etc/systemd/system/salvorias-node.service && ! -e /etc/salvorias && ! -e /opt/salvorias && ! -e /usr/local/bin/salvorias-node && ! -e /usr/local/sbin/salvorias-selfhost ]]'
 expect_stat "$DATA/node-key.txt" "600 salvorias:salvorias"

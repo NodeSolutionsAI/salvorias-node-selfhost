@@ -26,7 +26,8 @@ not run a server, use Save Hosting in the Salvorias app instead.
   shown in the Salvorias app.
 - A **node license** in that wallet. If every license you hold already has a
   node (for example on Save Hosting), you can still install: when you register,
-  the app tells you which node this one replaces and asks you to confirm.
+  the app tells you which node this one replaces, and asks you to confirm
+  before moving a node off Save Hosting.
 - Some **SAVDR to send to the node**. A self-hosted node pays the network fee
   for its own daily check-in.
 
@@ -91,14 +92,15 @@ The default network is **mainnet**. To try it on testnet first, add
    > passcode.
 
    On testnet the link is https://app.dev.salvorias.com/licenses/self-host.
-   You never choose a license slot: the app picks one. It uses a license with
-   no node first. If there is none, it replaces a node that has not checked in
-   for 2 days or more. If every node is active, it warns you and asks you to
-   confirm before it moves one of them to this server. When every license
-   already has a node, the box adds:
+   You never choose which license the node goes on: the app picks. It uses a
+   license with no node first. If there is none, it replaces the node that has
+   gone longest without a check-in (2 days or more) and tells you so. If every
+   node is active, it warns you and, once you confirm, moves a node off Save
+   Hosting to make room. When every license already has a node, the box adds:
 
-   > All your licenses already have a node. When you register, the app will
-   > tell you which node this replaces and ask you to confirm.
+   > All your licenses already have a node. When you register, the app tells
+   > you which node this replaces, and asks you to confirm before moving a
+   > node off Save Hosting.
 
    It also tells you how much SAVDR to keep on the node address: the
    per-check-in reserve. That is the balance the chain requires before it
@@ -138,9 +140,12 @@ Only one command that changes the server runs at a time. Each takes a lock
 (`/run/salvorias-selfhost.lock`); a second one started meanwhile stops with
 exit code 4 and changes nothing. `status` only reads, so it runs any time.
 
-After `uninstall`, your license still points at the node on-chain.
-Registering another node in the Salvorias app (Licenses > Self Setup)
-replaces it.
+After `uninstall`, your license keeps pointing at the node. To move the node
+to another server, back up its key here with `backup-key`, then install there
+with `--import-key` and that file: no new registration is needed (see
+[Moving the node to a new server](#moving-the-node-to-a-new-server)). If you
+register a different node instead, the app may replace this node or, if all
+your licenses are busy, a Save Hosting node, after asking you.
 
 ### Funding
 
@@ -296,9 +301,10 @@ Exit codes:
 - **"holds no Salvorias node license"**: you entered a wallet other than
   the one holding the license. Use the address shown in the app.
 - **"All your licenses already have a node"**: not an error. Register the
-  node anyway; the app tells you which node it replaces and asks you to
-  confirm. If that node is on Save Hosting, your Save Hosting billing does not
-  change by itself: contact support to reduce it.
+  node anyway; the app tells you which node it replaces, and asks you to
+  confirm before moving a node off Save Hosting. If that node is on Save
+  Hosting, your Save Hosting billing does not change by itself: contact
+  support to reduce it.
 - **The registration wait timed out**: nothing is lost. Register the node in
   the app, then run `sudo salvorias-selfhost resume`.
 - **The service keeps restarting**: run `sudo salvorias-selfhost status` and

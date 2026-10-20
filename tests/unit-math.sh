@@ -18,13 +18,13 @@ extract() {
 extract_var() { grep -m 1 "^$1=" install.sh; }
 
 src=""
-for var in URL_PORT_RE URL_PATH_RE LOCAL_HTTP_RE HTTPS_URL_RE REPO_RE VERSION_LINE_SED; do
+for var in URL_PORT_RE URL_PATH_RE LOCAL_HTTP_RE HTTPS_URL_RE REPO_RE VERSION_LINE_SED NODE_RUN_PATH; do
   body=$(extract_var "$var")
   [[ -n "$body" ]] || { echo "FAIL: could not extract $var from install.sh"; exit 1; }
   src+="$body"$'\n'
 done
-for fn in say strip_zeros wei_lt wei_to_savdr wei_times checkins_left is_uint json_str json_raw print_funding \
-    is_local_http_url is_safe_url is_safe_repo checksum_for check_elf; do
+for fn in say lower strip_zeros wei_lt wei_to_savdr wei_times checkins_left is_uint json_str json_raw json_list \
+    read_binding print_funding is_local_http_url is_safe_url is_safe_repo checksum_for check_elf node_run; do
   body=$(extract "$fn")
   [[ -n "$body" ]] || { echo "FAIL: could not extract $fn from install.sh"; exit 1; }
   src+="$body"$'\n'
@@ -184,6 +184,81 @@ check "'..' is not a version" "$(version_of 'salvorias-node v..')" ""
 check "a leading dot is not a version" "$(version_of 'salvorias-node v.hidden')" ""
 check "a leading dash is not a version" "$(version_of 'salvorias-node v-rf')" ""
 check "a slash is not a version" "$(version_of 'salvorias-node v0/../x')" ""
+
+echo "## slot-info's openSlots list: a missing key is not an empty list"
+SLOT_JSON='{"chainId":7283,"licenseBalance":2,"openSlots":[0,1]}'
+check "two free" "$(json_list openSlots)" "0,1"
+check_true "a list reads" eval 'json_list openSlots >/dev/null'
+SLOT_JSON='{"chainId":7283,"licenseBalance":2,"openSlots":[]}'
+check "none free" "$(json_list openSlots)" ""
+check_true "an empty list reads (no free license is not an error)" eval 'json_list openSlots >/dev/null'
+SLOT_JSON='{"chainId":7283,"licenseBalance":2}'
+check_false "a missing openSlots fails" json_list openSlots
+SLOT_JSON='{"chainId":7283,"licenseBalance":2,"xopenSlots":[]}'
+check_false "another key ending in openSlots does not count" json_list openSlots
+SLOT_JSON='{"chainId":7283,"openSlots":["0"]}'
+check_false "a list of strings fails" json_list openSlots
+SLOT_JSON='{"chainId":7283,"openSlots":null}'
+check_false "null fails" json_list openSlots
+SLOT_JSON='{"chainId":7283,"openSlots":[0,,1]}'
+check_false "a malformed list fails" json_list openSlots
+SLOT_JSON='{"error":"RPC down"}'
+check_false "an error object fails" json_list openSlots
+# read_open_slots must stop on a missing list rather than go on as if every
+# license had a node. Run in a child shell with the real function and a
+# stand-in die that exits as the installer's does.
+open_slots_of() {
+  local json="$1"
+  # The quoted lines are the child shell's own code.
+  # shellcheck disable=SC2016
+  { printf '%s\n' 'set -euo pipefail' 'die() { printf "DIE: %s\n" "$*"; exit 1; }'
+    extract json_list
+    extract read_open_slots
+    printf 'SLOT_JSON=%q\n' "$json"
+    printf '%s\n' 'read_open_slots' 'printf "OPEN=[%s]\n" "$OPEN_SLOTS"'
+  } | bash
+}
+open_rc=0
+open_out=$(open_slots_of '{"chainId":7283,"licenseBalance":2}') || open_rc=$?
+check "a missing openSlots stops the install" "$open_rc" "1"
+check_has "with a clear message" "$open_out" "DIE: The chain query returned no readable list of free licenses"
+check_lacks "and never reaches the no-free-license path" "$open_out" "OPEN="
+check "an empty list goes on, as no free license" "$(open_slots_of '{"openSlots":[]}')" "OPEN=[]"
+check "a list goes on" "$(open_slots_of '{"openSlots":[1]}')" "OPEN=[1]"
+
+echo "## registered means bound to a license entry, not only named by nodeToOwner"
+# Read by read_binding.
+# shellcheck disable=SC2034
+OWNER="0x00000000000000000000000000000000000000Aa"
+OTHER="0x00000000000000000000000000000000000000bB"
+# SLOT_JSON and BOUND_OTHER are read and set by read_binding.
+# shellcheck disable=SC2034
+binding_of() { SLOT_JSON="$1"; BOUND_STATE=""; BOUND_OTHER=""; read_binding; printf '%s' "$BOUND_STATE"; }
+check "owner (any case) and slot 0: registered" "$(binding_of '{"boundOwner":"0x00000000000000000000000000000000000000aA","boundSlot":0,"boundSlotSource":"getter"}')" "owner"
+check "owner and slot 3: registered" "$(binding_of '{"boundOwner":"'"$OWNER"'","boundSlot":3,"boundSlotSource":"scan"}')" "owner"
+check "owner, slot null: replaced, not registered" "$(binding_of '{"boundOwner":"'"$OWNER"'","boundSlot":null,"boundSlotSource":null}')" "replaced"
+check "owner, no boundSlot key: not registered" "$(binding_of '{"boundOwner":"'"$OWNER"'"}')" "replaced"
+check "no owner: unbound" "$(binding_of '{"boundOwner":null,"boundSlot":null}')" "unbound"
+check "another wallet: other" "$(binding_of '{"boundOwner":"'"$OTHER"'","boundSlot":null}')" "other"
+
+echo "## the node binary runs with a scrubbed environment"
+# A stand-in binary that prints its environment and working directory. The
+# quoted $(pwd) is the stand-in's own code, expanded when it runs.
+# shellcheck disable=SC2016
+printf '#!/bin/sh\nenv\necho "CWD=$(pwd)"\n' >"$T/env-node"
+chmod 0755 "$T/env-node"
+scrubbed=$(cd "$T" && NFT_CONTRACT=0x000000000000000000000000000000000000dEaD CHECKIN_CONTRACT=junk \
+  RPC_URL=http://junk NODE_KEYS_FILE=/junk SALVORIAS_NODE_VERSION=6.6.6 node_run 10 "$T/env-node")
+check_lacks "NFT_CONTRACT is not passed on" "$scrubbed" "NFT_CONTRACT"
+check_lacks "CHECKIN_CONTRACT is not passed on" "$scrubbed" "CHECKIN_CONTRACT"
+check_lacks "RPC_URL is not passed on" "$scrubbed" "RPC_URL"
+check_lacks "NODE_KEYS_FILE is not passed on" "$scrubbed" "NODE_KEYS_FILE"
+check_lacks "SALVORIAS_NODE_VERSION is not passed on" "$scrubbed" "SALVORIAS_NODE_VERSION"
+check_has "PATH is set" "$scrubbed" "PATH=$NODE_RUN_PATH"
+check_has "HOME is set" "$scrubbed" "HOME=/root"
+check_has "it runs from /, away from any .env in the caller's directory" "$scrubbed" "CWD=/"
+# sh itself adds PWD (and some shells SHLVL and _); nothing else may appear.
+check "nothing else is passed" "$(printf '%s\n' "$scrubbed" | grep -cv '^\(PATH\|HOME\|PWD\|OLDPWD\|SHLVL\|_\|CWD\)=' || true)" "0"
 
 echo "## an interrupt during the upgrade's switch back"
 # The real on_signal and undo_upgrade, with a switch_current slowed down so

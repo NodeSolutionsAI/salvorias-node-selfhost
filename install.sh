@@ -105,7 +105,7 @@ USAGE
 COMMANDS
   install          Set up the node (default command)
   resume           Continue an install that was waiting for registration
-  status           Service state, version, slot binding, balance, recent logs
+  status           Service state, version, registration, balance, recent logs
   upgrade          Install a newer node binary; rolls back if it fails to run.
                    Also restarts a stopped service and repairs file ownership
   backup-key       Copy the node key to a root-only file for offline storage
@@ -321,10 +321,12 @@ detect_running_file() {
 }
 
 # How the user should run a later command, given how this run was started.
+# cmd_hint COMMAND [self-gone]: with "self-gone", leaves out salvorias-selfhost
+# (for text printed just before an uninstall removes it).
 cmd_hint() {
-  if [[ -x "$SELF_PATH" ]]; then
+  if [[ -x "$SELF_PATH" && "${2:-}" != "self-gone" ]]; then
     printf 'sudo salvorias-selfhost %s' "$1"
-  elif [[ -n "$RUNNING_FILE" ]]; then
+  elif [[ -n "$RUNNING_FILE" && ( "${2:-}" != "self-gone" || "$RUNNING_FILE" != "$SELF_PATH" ) ]]; then
     printf 'sudo bash %s %s' "$RUNNING_FILE" "$1"
   else
     printf "curl --proto '=https' --proto-redir '=https' -fsSL https://github.com/%s/releases/latest/download/install.sh | sudo bash -s -- %s" "$SALVORIAS_RELEASE_REPO" "$1"
@@ -376,6 +378,9 @@ on_signal() {
 make_tmp_dir() {
   if [[ -z "$TMP_DIR" ]]; then
     TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/salvorias-install.XXXXXX")
+    # Absolute, because node_run runs the binary from / (a relative TMPDIR
+    # would otherwise point somewhere else there).
+    if [[ "$TMP_DIR" != /* ]]; then TMP_DIR="$PWD/$TMP_DIR"; fi
   fi
 }
 
@@ -575,7 +580,7 @@ stage_binary() {
   check_elf "$STAGED_BIN" || die "The node binary cannot be used on this server: $ELF_PROBLEM. Nothing was changed."
 
   local out rc=0
-  out=$("$STAGED_BIN" version </dev/null 2>&1) || rc=$?
+  out=$(node_run 60 "$STAGED_BIN" version </dev/null 2>&1) || rc=$?
   if (( rc != 0 )); then
     die "The node binary does not run on this server (exit $rc: ${out:0:200}). Check it matches this CPU ($ASSET_ARCH). If ${TMPDIR:-/tmp} is mounted noexec, rerun with TMPDIR set to a directory that allows execution."
   fi
@@ -688,6 +693,24 @@ install_self_copy() {
   say "Installed management command: $SELF_PATH"
 }
 
+# ─── Running the node binary ───────────────────────────────────────────────
+
+# The node binary takes its settings from the environment (RPC_URL,
+# CHECKIN_CONTRACT, NFT_CONTRACT, NODE_KEYS_FILE, NODE_PRIVATE_KEY(S),
+# SALVORIAS_NODE_VERSION, ...), and a Bun executable may also load a .env
+# file from its working directory. The installer passes everything it means
+# on the command line, so it runs the binary with an empty environment (PATH
+# and HOME only), from /: nothing set in the caller's shell or cwd can change
+# what a query reports. The service itself gets its settings from node.env.
+NODE_RUN_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# node_run SECONDS BIN ARGS...: BIN and every path in ARGS must be absolute.
+node_run() {
+  local secs="$1" bin="$2"
+  shift 2
+  ( cd / && exec timeout "$secs" env -i PATH="$NODE_RUN_PATH" HOME=/root "$bin" "$@" )
+}
+
 # ─── slot-info ─────────────────────────────────────────────────────────────
 
 SLOT_JSON=""
@@ -698,7 +721,7 @@ run_slot_info() {
   local bin="$1" node="${2:-}" rc=0
   local args=(slot-info --rpc-url "$RPC_URL" --contract "$NET_CHECKIN" --owner "$OWNER")
   if [[ -n "$node" ]]; then args+=(--node "$node"); fi
-  SLOT_JSON=$(timeout 120 "$bin" "${args[@]}" </dev/null 2>/dev/null) || rc=$?
+  SLOT_JSON=$(node_run 120 "$bin" "${args[@]}" </dev/null 2>/dev/null) || rc=$?
   return "$rc"
 }
 
@@ -706,7 +729,24 @@ run_slot_info() {
 # these extractors cover it without adding a jq dependency.
 json_str() { printf '%s' "$SLOT_JSON" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
 json_raw() { printf '%s' "$SLOT_JSON" | sed -n "s/.*\"$1\":\([^,}\"]*\).*/\1/p"; }
-json_list() { printf '%s' "$SLOT_JSON" | sed -n "s/.*\"$1\":\[\([^]]*\)\].*/\1/p"; }
+# json_list KEY prints a list of whole numbers, comma-separated ("" for []).
+# It fails when KEY is missing or is not such a list, so a missing key is
+# never mistaken for an empty list.
+json_list() {
+  local re="[{,]\"$1\":\\[([^]]*)\\]" items
+  [[ "$SLOT_JSON" =~ $re ]] || return 1
+  items="${BASH_REMATCH[1]}"
+  [[ -z "$items" || "$items" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 1
+  printf '%s' "$items"
+}
+
+# Sets OPEN_SLOTS from SLOT_JSON's openSlots, or stops: without a readable
+# list the installer cannot tell whether a license is free.
+OPEN_SLOTS=""
+read_open_slots() {
+  OPEN_SLOTS=$(json_list openSlots) \
+    || die "The chain query returned no readable list of free licenses, so the installer cannot tell whether one is free. Check that the node binary is current, then try again."
+}
 
 # Runs slot-info and stops with a clear message on failure.
 query_chain() {
@@ -1068,7 +1108,7 @@ DERIVED_ADDRESS=""
 derive_address() {
   local out
   DERIVED_ADDRESS=""
-  out=$(timeout 60 "$1" key-address --keys-file "$2" </dev/null 2>/dev/null) || return 1
+  out=$(node_run 60 "$1" key-address --keys-file "$2" </dev/null 2>/dev/null) || return 1
   is_address "$out" || return 1
   DERIVED_ADDRESS="$out"
 }
@@ -1196,7 +1236,7 @@ ensure_node_key() {
       [[ ! -e "$KEY_FILE" && ! -L "$KEY_FILE" ]] || die "$KEY_FILE appeared during the install. Refusing to replace it."
       make_data_stage
       staged="$DATA_STAGE/node-key.txt"
-      addr=$("$PATH_LINK" keygen --out "$staged" </dev/null) || rc=$?
+      addr=$(node_run 60 "$PATH_LINK" keygen --out "$staged" </dev/null) || rc=$?
       (( rc == 0 )) || die "Node key generation failed (exit $rc)."
       is_address "$addr" || die "keygen returned an unexpected address."
       if ! { derive_address "$PATH_LINK" "$staged" && same_address "$DERIVED_ADDRESS" "$addr"; }; then
@@ -1223,8 +1263,17 @@ ensure_node_key() {
 
 # ─── Registration and funding ──────────────────────────────────────────────
 
-# Sets BOUND_STATE (unbound, owner, other) from SLOT_JSON. The slot number is
-# deliberately not kept: nothing shown to the user names a slot.
+# Sets BOUND_STATE from SLOT_JSON:
+#   owner     registered: one of OWNER's licenses points at this node
+#   replaced  the chain still names OWNER for this node, but none of OWNER's
+#             licenses points at it any more (the app put another node there)
+#   other     the chain names a different wallet for this node
+#   unbound   no wallet at all
+# boundOwner alone is the contract's reverse mapping (nodeToOwner), which can
+# outlive the license entry it came from. slot-info fills boundSlot only once
+# the owner's license entry itself is found pointing at the node, so
+# "registered" needs both. The slot number is not kept: nothing shown to the
+# user names a slot.
 BOUND_STATE=""
 BOUND_OTHER=""
 read_binding() {
@@ -1233,7 +1282,11 @@ read_binding() {
   if [[ -z "$bound" ]]; then
     BOUND_STATE="unbound"
   elif [[ "$(lower "$bound")" == "$(lower "$OWNER")" ]]; then
-    BOUND_STATE="owner"
+    if is_uint "$(json_raw boundSlot)"; then
+      BOUND_STATE="owner"
+    else
+      BOUND_STATE="replaced"
+    fi
   else
     BOUND_STATE="other"
     BOUND_OTHER="$bound"
@@ -1292,7 +1345,8 @@ print_registration_box() {
   if [[ -z "$slots" ]]; then
     say ""
     say "   All your licenses already have a node. When you register, the app"
-    say "   will tell you which node this replaces and ask you to confirm."
+    say "   tells you which node this replaces, and asks you to confirm before"
+    say "   moving a node off Save Hosting."
   fi
   say ""
   rule
@@ -1324,7 +1378,7 @@ wait_for_binding() {
           return 0
           ;;
         other)
-          die "Node $NODE_ADDRESS was registered to a different wallet ($BOUND_OTHER), not $OWNER. Clear that slot in the app for wallet $BOUND_OTHER, then run: $(cmd_hint uninstall) and install again with the right owner."
+          die "Node $NODE_ADDRESS was registered to a different wallet ($BOUND_OTHER), not $OWNER. Remove it from that wallet's licenses in the app (signed in with $BOUND_OTHER), then run: $(cmd_hint uninstall) and install again with the right owner."
           ;;
       esac
       say "  $(date +%H:%M:%S)  not registered yet"
@@ -1467,13 +1521,13 @@ cmd_install() {
   query_chain "$STAGED_BIN" "$NODE_ADDRESS"
   OWNER=$(json_str owner)
   is_address "$OWNER" || die "Chain query returned no owner address."
-  local nft licenses slots
+  local nft licenses
   nft=$(json_str nftContract)
   if [[ "$(lower "$nft")" != "$(lower "$NET_NFT")" ]]; then
     die "NodeCheckIn on $NETWORK counts licenses on NFT contract $nft, but this installer expects $NET_NFT. Refusing to continue: the installer may be out of date."
   fi
   licenses=$(json_raw licenseBalance)
-  slots=$(json_list openSlots)
+  read_open_slots
   is_uint "$licenses" || die "Chain query returned no license balance."
 
   BOUND_STATE="unbound"
@@ -1488,10 +1542,13 @@ cmd_install() {
     stop "Wallet $OWNER holds no Salvorias node license on $NETWORK. Check that you entered the wallet that owns your license (the one in your Salvorias app). Nothing was installed."
   fi
   # With every license already holding a node the install still goes ahead:
-  # the app chooses which node the registration replaces and asks the owner
-  # to confirm (print_registration_box says so).
+  # the app chooses which node the registration replaces, and asks the owner
+  # to confirm before it moves a node off Save Hosting (print_registration_box
+  # says so).
   if [[ "$BOUND_STATE" == "owner" ]]; then
     say "Node $NODE_ADDRESS is already registered to this wallet; no new registration needed."
+  elif [[ "$BOUND_STATE" == "replaced" ]]; then
+    say "Node $NODE_ADDRESS was registered to this wallet before, but another node has since taken its place. Register it again in the app (shown below)."
   fi
 
   # The funding box and the registration wait both depend on slot-info
@@ -1528,7 +1585,7 @@ cmd_install() {
     print_funding
     rule
   else
-    print_registration_box "$slots"
+    print_registration_box "$OPEN_SLOTS"
     wait_for_binding "$OPT_WAIT_MINUTES"
   fi
   finalize_install
@@ -1626,7 +1683,8 @@ cmd_resume() {
   query_chain "$PATH_LINK" "$NODE_ADDRESS"
   read_binding
   if [[ "$BOUND_STATE" != "owner" ]]; then
-    print_registration_box "$(json_list openSlots)"
+    read_open_slots
+    print_registration_box "$OPEN_SLOTS"
     wait_for_binding "$OPT_WAIT_MINUTES"
   fi
   finalize_install
@@ -1641,7 +1699,7 @@ cmd_status() {
   say "  Network:   $NETWORK (chain $NET_CHAIN_ID, $RPC_URL)"
   say "  Install:   $ST_STAGE"
   say "  Service:   $(systemctl is-active "$UNIT_NAME" 2>/dev/null || true), $(systemctl is-enabled "$UNIT_NAME" 2>/dev/null || printf 'not installed') at boot"
-  say "  Version:   $("$PATH_LINK" version </dev/null 2>/dev/null || printf 'binary missing') ($(current_version_name))"
+  say "  Version:   $(node_run 30 "$PATH_LINK" version </dev/null 2>/dev/null || printf 'binary missing') ($(current_version_name))"
   say "  Node:      $NODE_ADDRESS"
   say "  Owner:     $OWNER"
 
@@ -1649,6 +1707,7 @@ cmd_status() {
     read_binding
     case "$BOUND_STATE" in
       owner) say "  Binding:   registered to the owner" ;;
+      replaced) say "  Binding:   NOT REGISTERED: another node has taken its place (app > Licenses > Self Setup, paste the node address to register it again)" ;;
       other) say "  Binding:   REGISTERED TO A DIFFERENT WALLET ($BOUND_OTHER)" ;;
       *) say "  Binding:   NOT REGISTERED (app > Licenses > Self Setup, paste the node address)" ;;
     esac
@@ -2056,13 +2115,25 @@ cmd_uninstall() {
     write_account_marker
   fi
 
+  # The license is not freed by an uninstall, and the app counts this node as
+  # active for 2 days after its last check-in. Registering a new node right
+  # away can therefore move a Save Hosting node instead (after a warning), so
+  # the reminder points at moving the key rather than at a new registration.
   say ""
   if [[ -n "$addr" ]]; then
-    say "If node $addr was registered to one of your licenses, that license still points at it on-chain."
+    say "If node $addr was registered to one of your licenses, that license keeps pointing at it."
   else
-    say "If the node was registered to one of your licenses, that license still points at it on-chain."
+    say "If the node was registered to one of your licenses, that license keeps pointing at it."
   fi
-  say "Registering another node in the Salvorias app (Licenses > Self Setup) replaces it."
+  if [[ -e "$KEY_FILE" ]]; then
+    local hint_mode=""
+    if (( incomplete == 0 )); then hint_mode="self-gone"; fi
+    say "To move this node to another server, copy its key here with:"
+    say "  $(cmd_hint backup-key "$hint_mode")"
+    say "then install there with --import-key and that file. No new registration is needed."
+  fi
+  say "If you register a different node instead, the app may replace this node or, if all"
+  say "your licenses are busy, a Save Hosting node, after asking you."
 
   # Last, so the steps above can still be retried with it if anything failed.
   if (( incomplete == 1 )); then
