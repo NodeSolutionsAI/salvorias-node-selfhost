@@ -23,18 +23,13 @@ for var in URL_PORT_RE URL_PATH_RE LOCAL_HTTP_RE HTTPS_URL_RE REPO_RE VERSION_LI
   [[ -n "$body" ]] || { echo "FAIL: could not extract $var from install.sh"; exit 1; }
   src+="$body"$'\n'
 done
-for fn in say lower strip_zeros wei_lt wei_to_savdr wei_times checkins_left is_uint json_str json_raw json_list \
-    read_binding print_funding is_local_http_url is_safe_url is_safe_repo checksum_for check_elf node_run; do
+for fn in say lower strip_zeros wei_lt warn wei_to_savdr is_uint json_str json_raw json_list \
+    read_binding print_funding warn_if_unfunded is_local_http_url is_safe_url is_safe_repo checksum_for check_elf node_run; do
   body=$(extract "$fn")
   [[ -n "$body" ]] || { echo "FAIL: could not extract $fn from install.sh"; exit 1; }
   src+="$body"$'\n'
 done
 eval "$src"
-# Read by the functions eval'd above, which shellcheck cannot see.
-# shellcheck disable=SC2034
-MAX_GAS_PRICE_GWEI=50
-# shellcheck disable=SC2034
-DAYS_TO_FUND=90
 
 fails=0
 check() {
@@ -61,8 +56,6 @@ check_false "10 < 5" wei_lt 10 5
 check_false "10 < 10" wei_lt 10 10
 check_true "compare above 64-bit" wei_lt 99999999999999999999 100000000000000000000
 check_false "leading zeros ignored" wei_lt 0010 9
-check "reserve plus 90 check-ins" "$(wei_times 212500000000000 91)" "19337500000000000"
-check "check-ins left" "$(checkins_left 1000000000000000000 212500000000000)" "4705"
 
 echo "## whole numbers (they go into bash arithmetic, where 08 is invalid octal)"
 check_true "0 is a whole number" is_uint 0
@@ -92,19 +85,44 @@ echo "## funding text"
 SLOT_JSON='{"chainId":7282,"node":"0x6c444c60Ede77B5cEd767467b676160c9F564E97","boundOwner":null,"boundSlot":null,"nodeBalanceWei":"0","checkInGasLimit":100000,"feeType":"eip1559","feePerGasWei":"2125000000","estimatedCheckInCostWei":"212500000000000"}'
 out=$(print_funding)
 printf '%s\n' "$out" | sed 's/^/    | /'
-check_has "reserve, not a fee" "$out" "Keep at least 0.0002125 SAVDR on the node (the per-check-in reserve"
-check_has "actual fees are lower" "$out" "actual fees are lower"
-check_has "reserve at the cap" "$out" "reserve is at most 0.005 SAVDR"
-check_has "90-day suggestion is reserve plus 90" "$out" "Suggested for about 90 days: 0.0193375 SAVDR"
-check_has "suggestion explained" "$out" "the reserve"$'\n'"   plus 90 check-ins charged at the full reserve"
-check_lacks "no claim that a check-in costs the reserve" "$out" "One check-in costs"
+# The same text whatever the fee: the old wording called a zero fee free.
+FUND_WANT_1="Send 1 SAVDR to the NODE address above. The node pays a tiny fee for each"
+FUND_WANT_2="daily check-in, so 1 SAVDR will last a while. An address with no SAVDR"
+FUND_WANT_3="cannot check in at all, even when fees are zero."
+FUND_WANT_4="Your wallet also needs a little SAVDR (0.01 is plenty) to send the"
+check_has "send 1 SAVDR to the node" "$out" "$FUND_WANT_1"
+check_has "1 SAVDR will last a while" "$out" "$FUND_WANT_2"
+check_has "an unfunded address cannot check in" "$out" "$FUND_WANT_3"
+check_has "the wallet needs a little SAVDR" "$out" "$FUND_WANT_4"
 check_has "balance" "$out" "Current node balance: 0 SAVDR"
+check_lacks "no per-check-in reserve" "$out" "reserve"
+check_lacks "no 90-day suggestion" "$out" "90"
+check_lacks "no cap math" "$out" "gwei"
 
 # shellcheck disable=SC2034
-SLOT_JSON='{"nodeBalanceWei":"0","checkInGasLimit":100000,"feePerGasWei":"0","estimatedCheckInCostWei":"0"}'
+SLOT_JSON='{"nodeBalanceWei":"1500000000000000000","checkInGasLimit":100000,"feePerGasWei":"0","estimatedCheckInCostWei":"0"}'
 out=$(print_funding)
-check_has "zero fee explained" "$out" "network fee is 0 right now"
-check_has "zero fee: cap reserve named" "$out" "reserves up to"
+check_lacks "fee 0: 'cost nothing today' is gone" "$out" "cost nothing"
+check_lacks "fee 0: no 'network fee is 0 right now'" "$out" "network fee is 0 right now"
+check_has "fee 0: send 1 SAVDR" "$out" "$FUND_WANT_1"
+check_has "fee 0: unfunded cannot check in" "$out" "$FUND_WANT_3"
+check_has "fee 0: wallet line" "$out" "$FUND_WANT_4"
+check_has "balance is shown in SAVDR" "$out" "Current node balance: 1.5 SAVDR"
+check_lacks "the install script no longer says 'cost nothing today'" "$(cat install.sh)" "cost nothing today"
+check_lacks "the install script makes no claim about years" "$(cat install.sh)" "for years"
+check_lacks "the README makes no claim about years" "$(cat README.md)" "for years"
+
+echo "## the unfunded warning"
+NODE_ADDRESS="0x6c444c60Ede77B5cEd767467b676160c9F564E97"
+WARN_WANT="This node will not check in until it holds some SAVDR. Send 1 SAVDR to $NODE_ADDRESS."
+check_has "zero balance, fee 0: warns" "$(warn_if_unfunded 0 0 2>&1)" "$WARN_WANT"
+check_has "zero balance, fee non-zero: warns" "$(warn_if_unfunded 0 212500000000000 2>&1)" "$WARN_WANT"
+check_has "zero balance, cost unreadable: warns" "$(warn_if_unfunded 0 "" 2>&1)" "$WARN_WANT"
+check "1 SAVDR, fee 0: silent" "$(warn_if_unfunded 1000000000000000000 0 2>&1)" ""
+check "1 SAVDR, non-zero fee: silent" "$(warn_if_unfunded 1000000000000000000 212500000000000 2>&1)" ""
+check_has "below the reserve: still warns" "$(warn_if_unfunded 100 212500000000000 2>&1)" "below the per-check-in reserve (0.0002125 SAVDR"
+check_lacks "below the reserve is not the zero warning" "$(warn_if_unfunded 100 212500000000000 2>&1)" "$WARN_WANT"
+check "balance unreadable: silent" "$(warn_if_unfunded "" 0 2>&1)" ""
 
 echo "## URL rules"
 for u in https://salvorias.net https://testnet.salvorias.net https://rpc.example.com:8443/v1/abc-123 \

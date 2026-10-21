@@ -464,8 +464,12 @@ expect_no_log piped-timeout '[Ss]lot\(s\)|[Ff]ree slot|\(slot [0-9]|Slot: ' "no 
 expect_no_log piped-timeout 'All your licenses already have a node' "no replace notice while a license is free"
 expect_log piped-timeout 'Open https://app\.dev\.salvorias\.com/licenses/self-host$' "the testnet portal link is printed"
 expect_log piped-timeout 'Licenses > Self Setup\), paste this node address' "app instruction printed"
-expect_log piped-timeout 'Keep at least .* SAVDR on the node \(the per-check-in reserve' "funding text names the reserve"
-expect_log piped-timeout 'Suggested for about 90 days: .* SAVDR' "90-day suggestion printed"
+expect_log piped-timeout 'Send 1 SAVDR to the NODE address above\. The node pays a tiny fee for each' "funding text: send 1 SAVDR to the node"
+expect_log piped-timeout 'daily check-in, so 1 SAVDR will last a while\. An address with no SAVDR' "funding text: 1 SAVDR will last a while"
+expect_log piped-timeout 'cannot check in at all, even when fees are zero\.' "funding text: an unfunded address cannot check in"
+expect_log piped-timeout 'Your wallet also needs a little SAVDR \(0\.01 is plenty\) to send the' "funding text: the wallet needs a little SAVDR"
+expect_no_log piped-timeout 'cost nothing today|network fee is 0 right now' "funding text no longer says check-ins are free"
+expect_no_log piped-timeout 'per-check-in reserve|Suggested for about 90 days' "funding text has no reserve or 90-day math"
 expect_log piped-timeout 'sudo salvorias-selfhost resume' "timeout points to salvorias-selfhost resume"
 expect_true "salvorias-selfhost installed from the verified release copy" cmp -s "$SELF" "$WORK/rel-good/install.sh"
 expect_true "the planted ./main was not installed" bash -c "! grep -q 'planted main' $SELF"
@@ -542,8 +546,8 @@ run resume "$SELF" resume --wait-minutes 1
 expect_rc 0 "second resume starts the service"
 expect_log resume 'Salvorias node installed' "summary printed"
 expect_log resume 'sudo salvorias-selfhost status' "summary uses salvorias-selfhost forms"
-# The mock pins a 1 gwei fee and the node holds 0 SAVDR, so this must warn.
-expect_log resume 'below the per-check-in reserve' "low-balance warning (node holds 0 SAVDR)"
+# The node holds 0 SAVDR, so this must warn, whatever the fee is.
+expect_log resume "This node will not check in until it holds some SAVDR\\. Send 1 SAVDR to $NODE\\." "zero-balance warning (node holds 0 SAVDR)"
 expect_true "stage is installed" grep -q '^STAGE=installed$' /etc/salvorias/selfhost.conf
 
 section "9. service, files, owners and modes"
@@ -668,14 +672,15 @@ section "11. status (unfunded, then funded through the mock)"
 run status "$SELF" status
 expect_rc 0 "status"
 expect_log status 'Binding: +registered to the owner$' "status shows the binding, without a slot number"
-expect_log status 'Reserve per check-in: .* \(actual fees are lower\)' "status names the reserve"
+expect_log status "This node will not check in until it holds some SAVDR\\. Send 1 SAVDR to $NODE\\." "status warns while the node holds 0 SAVDR"
+expect_no_log status 'Reserve per check-in|Check-ins left' "status has no reserve or check-ins-left lines"
 expect_log status 'Last 20 log lines' "status shows the journal"
 printf '1000000000000000000\n' >"$MOCK_STATE/balance-wei"
 run status-funded "$SELF" status
 rm -f "$MOCK_STATE/balance-wei"
 expect_rc 0 "status with a balance"
 expect_log status-funded 'Balance: +1 SAVDR' "balance shown in SAVDR"
-expect_log status-funded 'Check-ins left: at least about' "check-ins left estimate shown"
+expect_no_log status-funded 'will not check in until it holds' "no zero-balance warning once funded"
 
 section "12. backup-key"
 run backup "$SELF" backup-key --out /root/node-key-backup.txt

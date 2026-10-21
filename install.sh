@@ -70,7 +70,6 @@ ACCOUNT_MARKER="$DATA_DIR/installer-account.txt"
 # network fee. The cap stops it from paying through a fee spike.
 GAS_PRICE_MODE="network"
 MAX_GAS_PRICE_GWEI=50
-DAYS_TO_FUND=90
 PROBE_NODE_ADDRESS="0x0000000000000000000000000000000000000001"
 
 EXIT_ERROR=1
@@ -245,24 +244,6 @@ wei_to_savdr() {
   frac="${w: -18}"
   while [[ "$frac" == *0 ]]; do frac="${frac%0}"; done
   if [[ -n "$frac" ]]; then printf '%s.%s' "$int" "$frac"; else printf '%s' "$int"; fi
-}
-
-# wei_times W N: W * N. Exact in shell arithmetic while W has at most 16
-# digits (any realistic check-in cost); beyond that an approximation is fine
-# because the result is only ever displayed.
-wei_times() {
-  local w
-  w=$(strip_zeros "$1")
-  if (( ${#w} <= 16 )); then
-    printf '%s' "$(( w * $2 ))"
-  else
-    awk -v w="$w" -v n="$2" 'BEGIN { printf "%.0f", w * n }'
-  fi
-}
-
-# Approximate whole check-ins a balance pays for. Display only.
-checkins_left() {
-  awk -v b="$1" -v c="$2" 'BEGIN { if (c > 0) printf "%d", b / c; else printf "unlimited at the current fee of 0" }'
 }
 
 # ─── Release file checks ───────────────────────────────────────────────────
@@ -1293,36 +1274,37 @@ read_binding() {
   fi
 }
 
-# Prints the funding lines from a slot-info --node result.
+# Prints the funding lines from a slot-info --node result. The fee itself is
+# not the point: on Salvorias an address that has never held SAVDR does not
+# exist on chain, so its transactions are refused ("the sender is not EOA")
+# even when the network fee is 0. A node with a zero balance can never check in.
 print_funding() {
-  local cost balance gas_limit cap_cost
-  cost=$(json_str estimatedCheckInCostWei)
+  local balance
   balance=$(json_str nodeBalanceWei)
-  gas_limit=$(json_raw checkInGasLimit)
-  is_uint "$cost" || cost=0
   is_uint "$balance" || balance=0
-  is_uint "$gas_limit" || gas_limit=100000
-  cap_cost=$(( gas_limit * MAX_GAS_PRICE_GWEI * 1000000000 ))
 
-  # slot-info's estimate is gas limit x max fee per gas: the balance the chain
-  # requires before it accepts a check-in, not what it charges. The charge is
-  # gas used x the fee actually paid, which is lower, so these numbers are
-  # deliberately upper bounds.
-  say "   Send SAVDR to the NODE address above (not to your license wallet)."
-  say "   The node pays the network fee for each daily check-in."
-  if [[ "$(strip_zeros "$cost")" == "0" ]]; then
-    say "   The network fee is 0 right now, so check-ins cost nothing today."
-    say "   Fees can rise: at the $MAX_GAS_PRICE_GWEI gwei cap the chain reserves up to"
-    say "   $(wei_to_savdr "$cap_cost") SAVDR per check-in, so keep some SAVDR on the node."
-  else
-    say "   Keep at least $(wei_to_savdr "$cost") SAVDR on the node (the per-check-in reserve"
-    say "   at today's fee); actual fees are lower. At the $MAX_GAS_PRICE_GWEI gwei cap the"
-    say "   reserve is at most $(wei_to_savdr "$cap_cost") SAVDR."
-    say "   Suggested for about $DAYS_TO_FUND days: $(wei_to_savdr "$(wei_times "$cost" "$((DAYS_TO_FUND + 1))")") SAVDR. That is the reserve"
-    say "   plus $DAYS_TO_FUND check-ins charged at the full reserve; actual fees are lower,"
-    say "   so it should last longer than that at today's fee."
-  fi
+  say "   Send 1 SAVDR to the NODE address above. The node pays a tiny fee for each"
+  say "   daily check-in, so 1 SAVDR will last a while. An address with no SAVDR"
+  say "   cannot check in at all, even when fees are zero."
+  say "   Your wallet also needs a little SAVDR (0.01 is plenty) to send the"
+  say "   registration."
   say "   Current node balance: $(wei_to_savdr "$balance") SAVDR"
+}
+
+# warn_if_unfunded BALANCE COST: BALANCE is the node's balance in wei and COST
+# slot-info's per-check-in reserve. A zero balance warns whatever the fee is
+# (see print_funding). A non-zero balance below the reserve is also refused by
+# the chain, so that still warns.
+warn_if_unfunded() {
+  local balance="$1" cost="$2"
+  is_uint "$balance" || return 0
+  if [[ "$(strip_zeros "$balance")" == "0" ]]; then
+    say ""
+    warn "This node will not check in until it holds some SAVDR. Send 1 SAVDR to $NODE_ADDRESS."
+  elif is_uint "$cost" && wei_lt "$balance" "$cost"; then
+    say ""
+    warn "The node balance is below the per-check-in reserve ($(wei_to_savdr "$cost") SAVDR at today's fee). The chain will not accept a check-in until you send more SAVDR to $NODE_ADDRESS."
+  fi
 }
 
 # print_registration_box OPEN_SLOTS: OPEN_SLOTS is slot-info's openSlots list.
@@ -1641,10 +1623,7 @@ finalize_install() {
     say "The imported key is now installed. Delete the copy you imported from:"
     say "  sudo shred -u $OPT_IMPORT_KEY"
   fi
-  if is_uint "$balance" && is_uint "$cost" && wei_lt "$balance" "$cost"; then
-    say ""
-    warn "The node balance is below the per-check-in reserve ($(wei_to_savdr "$cost") SAVDR at today's fee). The chain will not accept a check-in until you send SAVDR to $NODE_ADDRESS."
-  fi
+  warn_if_unfunded "$balance" "$cost"
   say ""
   say "Next:"
   say "  sudo salvorias-selfhost status       service, binding, balance, recent logs"
@@ -1714,13 +1693,9 @@ cmd_status() {
     local balance cost
     balance=$(json_str nodeBalanceWei)
     cost=$(json_str estimatedCheckInCostWei)
-    if is_uint "$balance" && is_uint "$cost"; then
+    if is_uint "$balance"; then
       say "  Balance:   $(wei_to_savdr "$balance") SAVDR"
-      say "  Reserve per check-in: $(wei_to_savdr "$cost") SAVDR at today's fee (actual fees are lower)"
-      say "  Check-ins left: at least about $(checkins_left "$balance" "$cost")"
-      if wei_lt "$balance" "$cost"; then
-        warn "Balance is below the per-check-in reserve. Send SAVDR to $NODE_ADDRESS."
-      fi
+      warn_if_unfunded "$balance" "$cost"
     fi
   else
     say "  Chain:     could not read the chain ($(json_str error))"

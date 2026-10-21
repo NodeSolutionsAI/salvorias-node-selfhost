@@ -28,8 +28,13 @@ not run a server, use Save Hosting in the Salvorias app instead.
   node (for example on Save Hosting), you can still install: when you register,
   the app tells you which node this one replaces, and asks you to confirm
   before moving a node off Save Hosting.
-- Some **SAVDR to send to the node**. A self-hosted node pays the network fee
-  for its own daily check-in.
+- Some **SAVDR**, the network's fee token, in two places:
+  - **Your wallet** (the one that holds the license): registering your node is
+    a transaction from your wallet, and the chain only accepts transactions
+    from wallets that hold some SAVDR. Keep at least 0.01 SAVDR in it.
+  - **The node address**: send 1 SAVDR to it. The node pays a tiny fee each
+    time it checks in (about 0.00006 SAVDR at today's rates), so 1 SAVDR will
+    last a while.
 
 ## Safety: what this installer will and will not do
 
@@ -102,12 +107,11 @@ The default network is **mainnet**. To try it on testnet first, add
    > you which node this replaces, and asks you to confirm before moving a
    > node off Save Hosting.
 
-   It also tells you how much SAVDR to keep on the node address: the
-   per-check-in reserve. That is the balance the chain requires before it
-   accepts a check-in (gas limit x today's maximum fee), not the fee it
-   charges; actual fees are lower. The suggested amount for about 90 days is
-   the reserve plus 90 check-ins charged at the full reserve, so it is an
-   upper bound at today's fee.
+   It also tells you what to fund: send 1 SAVDR to the node address (the node
+   pays a tiny fee for each daily check-in, so 1 SAVDR will last a while), and
+   keep a little SAVDR in your wallet (0.01 is plenty) to send the
+   registration. An address with no SAVDR cannot check in at all, even when
+   fees are zero.
 7. **Waits for the registration** to appear on-chain. It checks every 15
    seconds, for up to 30 minutes by default (`--wait-minutes N`).
    - Ctrl-C is safe. Your node key is kept, and you continue later with
@@ -116,7 +120,9 @@ The default network is **mainnet**. To try it on testnet first, add
    boot, then prints a summary.
    - If the service cannot be started, the install is not marked finished:
      fix the problem it shows, then run `sudo salvorias-selfhost resume`.
-   - If the node holds less SAVDR than the per-check-in reserve, it warns you.
+   - If the node holds no SAVDR, it warns you: "This node will not check in
+     until it holds some SAVDR." It also warns if the balance is below what
+     the chain requires to accept a check-in.
 
 ### Non-interactive install
 
@@ -128,7 +134,7 @@ sudo bash install.sh --owner 0xYourLicenseWalletAddress --wait-minutes 60
 
 | Command | What it does |
 | --- | --- |
-| `sudo salvorias-selfhost status` | Service state, version, node address, whether it is registered, balance, approximate check-ins left, last 20 log lines |
+| `sudo salvorias-selfhost status` | Service state, version, node address, whether it is registered, balance (with a warning while it is 0), last 20 log lines |
 | `sudo salvorias-selfhost resume` | Continue an install that was waiting for registration, or whose service did not start |
 | `sudo salvorias-selfhost upgrade [--version vX]` | Download and verify a newer node release, switch to it, restart. If the service is not running steadily after 30 seconds, or you press Ctrl-C while it watches, it switches back to the previous version. Also updates `salvorias-selfhost` itself. With the binary already current, it restarts a stopped service, and it brings an install made by an older installer to the current file layout. |
 | `sudo salvorias-selfhost upgrade --rollback` | Switch back to the version kept by the last upgrade, restart and watch it. Run it again to go forward. |
@@ -149,13 +155,19 @@ your licenses are busy, a Save Hosting node, after asking you.
 
 ### Funding
 
-The node wallet pays the network fee for each check-in, so keep SAVDR on the
-**node address** (not your license wallet). Keep at least the per-check-in
-reserve there: the chain only accepts a check-in from a wallet holding gas
-limit x maximum fee, even though the fee it charges is lower. `status` shows
-the balance, the reserve and at least how many check-ins the balance covers.
-The node never pays more than 50 gwei per unit of gas (see Configuration
-below).
+SAVDR is the network's fee token, and it is needed in two places.
+
+- **Your wallet**: registering your node is a transaction from your wallet,
+  and the chain only accepts transactions from wallets that hold some SAVDR.
+  Keep at least 0.01 SAVDR in it.
+- **The node address** (not your license wallet): send 1 SAVDR to it. The node
+  pays a tiny fee each time it checks in (about 0.00006 SAVDR at today's
+  rates), so 1 SAVDR will last a while.
+
+On Salvorias an address that has never held SAVDR does not exist on chain, so
+a node with a zero balance can never check in, even when the network fee is 0.
+`status` shows the node balance and warns while it is 0. The node never pays
+more than 50 gwei per unit of gas (see Configuration below).
 
 ### Back up the node key
 
@@ -309,7 +321,9 @@ Exit codes:
   the app, then run `sudo salvorias-selfhost resume`.
 - **The service keeps restarting**: run `sudo salvorias-selfhost status` and
   read the log lines. The node exits if its key is not registered on-chain.
-- **Low balance warning**: send SAVDR to the node address.
+- **"This node will not check in until it holds some SAVDR"**: send 1 SAVDR
+  to the node address. A node with a zero balance cannot check in, even when
+  the network fee is 0.
 
 ## Releases (maintainers)
 

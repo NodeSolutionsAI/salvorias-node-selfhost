@@ -17,7 +17,7 @@ bash tests/unit-math.sh      # needs bash 4.4+; the e2e suite also runs it in th
 
 These extract the pure helpers from `install.sh` and test them: wei
 formatting, whole-number validation (no leading zeros such as `08`, which
-bash arithmetic reads as invalid octal), the funding text (reserve wording and the 90-day suggestion), the
+bash arithmetic reads as invalid octal), the funding text (send 1 SAVDR to the node, the wallet line, no "cost nothing today" or reserve math) and the unfunded warning, the
 URL and repo rules, `checksums.txt` parsing (empty file, missing entry,
 `*name` entries, CRLF, conflicting entries), the ELF header check, and the
 version-name pattern (no `..`, leading dot or dash, or slash), the
@@ -137,7 +137,7 @@ messages, files, owners and modes.
     file named `main` that carries the installer marker. bash names a piped
     script `main`; the test checks that file is not installed, and that
     `salvorias-selfhost` comes from the release's verified `install.sh`;
-  - the registration wait timing out (exit 3), with the reserve funding text;
+  - the registration wait timing out (exit 3), with the funding text (1 SAVDR to the node, a little in the wallet);
   - the one-node guard while the install waits;
   - Ctrl-C during `resume`;
   - `resume` while the owner "registers" the node mid-wait, with the service
@@ -163,7 +163,7 @@ messages, files, owners and modes.
     while `status` still runs. A link at the lock path is refused and its
     target is untouched. During the Ctrl-C upgrade test below, an
     `uninstall --yes` started while the upgrade runs is refused the same way;
-  - `status`, unfunded and funded;
+  - `status`, unfunded (zero-balance warning) and funded;
   - `backup-key`: to a fresh path in a new root-only directory (0600
     root:root, no temp file left), and refused into a symlinked directory,
     a directory another user owns and a world-writable one;
