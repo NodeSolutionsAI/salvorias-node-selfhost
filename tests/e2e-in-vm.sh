@@ -14,7 +14,8 @@
 #
 # What it needs from outside: HTTPS to https://testnet.salvorias.net, for
 # reads only. It sends no transactions: the "licensed" scenarios go through
-# tests/mock-rpc.py, which refuses every transaction-sending method.
+# tests/mock-rpc.py, which never forwards a transaction-sending method (it
+# refuses them, or in one step answers them itself).
 
 set -euo pipefail
 
@@ -147,6 +148,30 @@ bind_when_ready() {
     sleep 1
   done
 }
+
+# fund_after LOG PATTERN STATE_DIR: plays the owner sending 1 SAVDR to the
+# node once $OUT/LOG shows PATTERN (so the step's output shows the state
+# before the funds arrive). The mock answers STATE_DIR/balance-wei for the
+# bound node and for the address in STATE_DIR/funded-node.
+fund_after() {
+  local _
+  for _ in $(seq 1 240); do
+    if grep -qE -- "$2" "$OUT/$1.log" 2>/dev/null; then
+      head -n 1 "$DATA/node-address.txt" >"$3/funded-node"
+      printf '1000000000000000000\n' >"$3/balance-wei"
+      return 0
+    fi
+    sleep 1
+  done
+}
+# boxes_in_order LOG: the funding box comes before the registration box.
+boxes_in_order() {
+  local f r
+  f=$(grep -n -m 1 -F ' STEP 1: FUND THE NODE' "$OUT/$1.log" | cut -d: -f1)
+  r=$(grep -n -m 1 -F ' STEP 2: REGISTER THIS NODE IN THE SALVORIAS APP' "$OUT/$1.log" | cut -d: -f1)
+  [[ -n "$f" && -n "$r" ]] && (( f < r ))
+}
+ACTIVE_NOTE_RE='^It can take up to 30 minutes for your license to show Active in the Salvorias app after the first check-in\. Check back then\.$'
 
 # ─── Decoys for the planted-link steps ────────────────────────────────────
 # Stand-ins for /etc/profile and /dev/vda. A planted node-key.txt or
@@ -366,6 +391,9 @@ expect_log slot-info-testnet '"boundSlotSource":null' "reports boundSlotSource f
 # the installer. check_existing_user accepts it; the purge below must keep it.
 useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin salvorias
 PRE_UID="$(id -u salvorias)"
+# Funded from the start (the mock answers balance-wei once the node is bound),
+# so the registration is the last step.
+printf '1000000000000000000\n' >"$FAITHFUL_STATE/balance-wei"
 bind_when_ready "$FAITHFUL_STATE" 4 &
 run faithful env SALVORIAS_POLL_SECONDS=3 bash "$INSTALL" --network testnet --rpc-url "$FAITHFUL_RPC" --binary "$BIN" --owner "$OWNER" --wait-minutes 3
 expect_rc 0 "a full install against the testnet contract shape completes"
@@ -374,6 +402,9 @@ expect_true "state records the account as not created by the installer" grep -qx
 expect_no_log faithful 'Could not read node registration data' "the slot-info --node pre-check passes"
 expect_log faithful 'Registered: node .* is bound to ' "registration found through the slot scan"
 expect_no_log faithful '\(slot [0-9]' "the registration line names no slot number"
+# The faithful mock refuses the daemon's first check-in.
+expect_log faithful '^The first check-in failed: ' "the first check-in result is reported"
+expect_log faithful "$ACTIVE_NOTE_RE" "the Active note follows the first check-in result"
 FNODE="$(cat "$DATA/node-address.txt")"
 run slot-info-scan "$BIN" slot-info --rpc-url "$FAITHFUL_RPC" --contract "$TESTNET_CHECKIN" --owner "$OWNER" --node "$FNODE"
 expect_log slot-info-scan '"boundSlotSource":"scan"' "slot came from the scan"
@@ -387,8 +418,9 @@ expect_log slot-info-replaced '"nodeBoundToOwner":true' "the mock keeps the stal
 expect_log slot-info-replaced '"boundSlot":null' "slot-info finds no license pointing at the node"
 run replaced-status "$SELF" status
 expect_rc 0 "status with the node replaced"
-expect_log replaced-status 'Binding: +NOT REGISTERED: another node has taken its place' "status says the node is no longer registered"
-expect_no_log replaced-status 'registered to the owner' "status does not call the replaced node registered"
+expect_log replaced-status 'Registered: +NO: another node has taken its place' "status says the node is no longer registered"
+expect_no_log replaced-status 'Registered: +yes' "status does not call the replaced node registered"
+expect_log replaced-status 'Funded: +yes \(1 SAVDR\)' "status shows the node funded"
 run replaced-uninstall "$SELF" uninstall --yes
 expect_rc 0 "uninstall (keeps the key) after the node was replaced"
 run replaced-reinstall env SALVORIAS_POLL_SECONDS=5 bash "$INSTALL" --network testnet --rpc-url "$FAITHFUL_RPC" --binary "$BIN" --owner "$OWNER" --wait-minutes 1
@@ -397,13 +429,21 @@ expect_log replaced-reinstall 'Found the node key kept by an earlier uninstall' 
 expect_log replaced-reinstall 'was registered to this wallet before, but another node has since taken its place' "says the node was replaced"
 expect_no_log replaced-reinstall 'already registered to this wallet' "no 'already registered' skip for a replaced node"
 expect_log replaced-reinstall 'REGISTER THIS NODE IN THE SALVORIAS APP' "registration box printed for the replaced node"
-expect_log replaced-reinstall 'not registered yet' "the wait loop keeps waiting while the node is replaced"
+expect_log replaced-reinstall '^  [0-9:]{8}  registered: no   funded: yes$' "the wait shows funded, not registered, while the node is replaced"
+expect_log replaced-reinstall 'Funded\. Now register the node in the app' "the wait says registration is the step left"
 expect_no_log replaced-reinstall 'Registered: node' "the wait loop does not report a registration"
+expect_log replaced-reinstall 'STOPPED: Waited 1 min\. The node is funded but not registered yet: register it in the app' "the timeout names the missing registration"
+# 12 polls over the minute; the state never changes, so one line (plus at
+# most one once-a-minute repeat), not one per poll.
+progress_lines=$(grep -cE '^  [0-9:]{8}  registered: ' "$OUT/replaced-reinstall.log" || true)
+expect_true "progress is printed on change or once a minute, not every poll ($progress_lines lines)" test "$progress_lines" -ge 1 -a "$progress_lines" -le 2
 rm -f "$FAITHFUL_STATE/replaced-by"
 run replaced-resume env SALVORIAS_POLL_SECONDS=3 "$SELF" resume --wait-minutes 1
 expect_rc 0 "registered again: resume completes"
 # Registered again before resume ran, so resume skips the box and the wait.
 expect_no_log replaced-resume 'REGISTER THIS NODE IN THE SALVORIAS APP' "resume sees the new registration (no registration box)"
+expect_no_log replaced-resume 'FUND THE NODE' "resume sees the node funded (no funding box)"
+expect_log replaced-resume 'is registered and holds 1 SAVDR' "resume goes straight on"
 expect_log replaced-resume '=== Salvorias node installed ===' "resume finishes the install"
 run faithful-purge with_tty "uninstall
 delete node key
@@ -415,7 +455,7 @@ expect_no_log faithful-purge 'Deleted the salvorias user' "purge does not delete
 expect_true "the pre-made account still exists, same UID" test "$(id -u salvorias 2>/dev/null)" = "$PRE_UID"
 expect_true "everything else removed" test ! -e /etc/salvorias -a ! -e /opt/salvorias -a ! -e "$DATA" -a ! -e "$SELF"
 userdel salvorias
-rm -f "$FAITHFUL_STATE/bound-node"
+rm -f "$FAITHFUL_STATE/bound-node" "$FAITHFUL_STATE/balance-wei"
 expect_true "server clean again" nothing_installed
 
 section "4c. no free slot: the install goes ahead and says the app will ask which node to replace"
@@ -438,6 +478,9 @@ expect_true "the binary is installed under its real version" test -d "/opt/salvo
 expect_no_log full-slots 'STOPPED: All' "no stop for a full set of licenses"
 expect_log full-slots 'Licenses held: 2' "the license count is shown"
 expect_log full-slots 'REGISTER THIS NODE IN THE SALVORIAS APP' "registration box printed"
+expect_true "box order: fund first, then register" boxes_in_order full-slots
+expect_log full-slots '^  [0-9:]{8}  registered: no   funded: no$' "the wait shows both states"
+expect_log full-slots 'STOPPED: Waited 1 min\. The node is not funded and not registered yet: send 1 SAVDR to 0x[0-9a-fA-F]{40}, and register it in the app' "the timeout names both missing steps"
 expect_log full-slots 'All your licenses already have a node\. When you register, the app$' "the replace notice is printed"
 expect_log full-slots 'tells you which node this replaces, and asks you to confirm before$' "the replace notice continues"
 expect_log full-slots 'moving a node off Save Hosting\.$' "the replace notice is complete"
@@ -457,13 +500,25 @@ section "5. piped install from the release, with a file named main in the cwd; r
 # the installer marker, must not be mistaken for the running script.
 mkdir -p "$WORK/cwd"
 { head -n 2 "$INSTALL"; printf '# e2e: planted main, must never be installed\n'; } >"$WORK/cwd/main"
+# The owner funds the node during the wait but never registers it.
+fund_after piped-timeout 'registered: no   funded: no' "$MOCK_STATE" &
 run piped-timeout bash -c "cd $WORK/cwd && cat $INSTALL | SALVORIAS_POLL_SECONDS=10 SALVORIAS_RELEASE_BASE_URL=http://127.0.0.1:8000 bash -s -- --network testnet --rpc-url $MOCK_RPC --owner $OWNER --wait-minutes 1"
+wait $! 2>/dev/null || true
 expect_rc 3 "registration wait times out with exit 3"
 expect_log piped-timeout 'REGISTER THIS NODE IN THE SALVORIAS APP' "registration box printed"
+expect_log piped-timeout '^ STEP 1: FUND THE NODE$' "box 1 is funding"
+expect_log piped-timeout '^ STEP 2: REGISTER THIS NODE IN THE SALVORIAS APP$' "box 2 is registration"
+expect_true "box order: fund first, then register" boxes_in_order piped-timeout
+expect_no_log piped-timeout 'STEP 1: REGISTER|STEP 2: FUND' "the old box order is gone"
+expect_log piped-timeout '^  [0-9:]{8}  registered: no   funded: no$' "the wait shows both states (neither yet)"
+expect_log piped-timeout '^  [0-9:]{8}  registered: no   funded: yes$' "the wait shows the funding arriving"
+expect_log piped-timeout 'Funded\. Now register the node in the app \(step 2\)' "the wait says registration is the step left"
+expect_log piped-timeout 'STOPPED: Waited 1 min\. The node is funded but not registered yet' "the timeout names the missing registration"
 expect_no_log piped-timeout '[Ss]lot\(s\)|[Ff]ree slot|\(slot [0-9]|Slot: ' "no slot numbers shown"
 expect_no_log piped-timeout 'All your licenses already have a node' "no replace notice while a license is free"
 expect_log piped-timeout 'Open https://app\.dev\.salvorias\.com/licenses/self-host$' "the testnet portal link is printed"
-expect_log piped-timeout 'Licenses > Self Setup\), paste this node address' "app instruction printed"
+expect_log piped-timeout 'Licenses > Self Setup\), paste the node address$' "app instruction printed"
+expect_log piped-timeout '^   from step 1 and confirm with your passcode\.$' "app instruction points at step 1"
 expect_log piped-timeout 'Send 1 SAVDR to the NODE address above\. The node pays a tiny fee for each' "funding text: send 1 SAVDR to the node"
 expect_log piped-timeout 'daily check-in, so 1 SAVDR will last a while\. An address with no SAVDR' "funding text: 1 SAVDR will last a while"
 expect_log piped-timeout 'cannot check in at all, even when fees are zero\.' "funding text: an unfunded address cannot check in"
@@ -481,6 +536,7 @@ expect_true "state is awaiting-registration" grep -q '^STAGE=awaiting-registrati
 expect_true "service not installed while unregistered" test ! -e /etc/systemd/system/salvorias-node.service
 expect_log piped-timeout 'Created system user: salvorias' "the installer created the account"
 expect_true "state records the account as created by the installer" grep -qx 'ACCOUNT_CREATED=yes' /etc/salvorias/selfhost.conf
+rm -f "$MOCK_STATE/funded-node" "$MOCK_STATE/balance-wei"
 
 section "6. one node per server while waiting"
 run second-while-waiting bash "$INSTALL" --network testnet --rpc-url "$MOCK_RPC" --binary "$BIN" --owner "$OWNER"
@@ -499,24 +555,36 @@ sed 's/^/    | /' "$OUT/sigint.log"; printf '    (exit %s)\n' "$RC"
 expect_rc 130 "interrupted resume exits 130"
 expect_log sigint 'Interrupted' "interrupt acknowledged"
 expect_log sigint 'continue with:' "interrupt explains how to resume"
+expect_log sigint 'The node is not funded and not registered yet: send 1 SAVDR to' "interrupt names both missing steps"
 expect_true "still awaiting registration after Ctrl-C" grep -q '^STAGE=awaiting-registration$' /etc/salvorias/selfhost.conf
 
-section "8. resume; the owner registers mid-wait; the first service start fails, a second resume starts it"
+section "8. resume; the owner registers, then funds, mid-wait; the first service start fails, a second resume starts it"
 MOCK_LINES_AT_START=$(wc -l <"$MOCK_STATE/mock-rpc.log")
 # A drop-in whose ExecStartPre fails makes `systemctl enable --now` fail.
 mkdir -p /etc/systemd/system/salvorias-node.service.d
 printf '[Service]\nExecStartPre=/bin/false\n' >/etc/systemd/system/salvorias-node.service.d/e2e-fail.conf
 STEP=$((STEP + 1))
-printf '\n--- [%02d] $ salvorias-selfhost resume (binding appears after 8s; start forced to fail)\n' "$STEP"
+printf '\n--- [%02d] $ salvorias-selfhost resume (binding appears after 8s, funding later; start forced to fail)\n' "$STEP"
 SALVORIAS_POLL_SECONDS=3 "$SELF" resume --wait-minutes 3 >"$OUT/resume-fail.log" 2>&1 &
 pid=$!
 sleep 8
 printf '%s\n' "$NODE" >"$MOCK_STATE/bound-node"
+# Registered but not funded: the install must keep waiting and start nothing.
+for _ in $(seq 1 60); do grep -q 'registered: yes   funded: no' "$OUT/resume-fail.log" && break; sleep 1; done
+sleep 7
+expect_true "registered, unfunded: the install is still waiting" kill -0 "$pid"
+expect_true "registered, unfunded: no unit file and no node.env written" test ! -e /etc/systemd/system/salvorias-node.service -a ! -e /etc/salvorias/node.env
+expect_true "registered, unfunded: the service is not started" bash -c '! systemctl is-active --quiet salvorias-node.service'
+expect_true "registered, unfunded: still awaiting-registration" grep -q '^STAGE=awaiting-registration$' /etc/salvorias/selfhost.conf
+printf '1000000000000000000\n' >"$MOCK_STATE/balance-wei"
 set +e; wait "$pid"; RC=$?; set -e
 sed 's/^/    | /' "$OUT/resume-fail.log"; printf '    (exit %s)\n' "$RC"
 expect_rc 1 "resume reports the failed start"
-expect_log resume-fail 'not registered yet' "polled while unregistered"
+expect_log resume-fail '^  [0-9:]{8}  registered: no   funded: no$' "polled while neither"
+expect_log resume-fail '^  [0-9:]{8}  registered: yes   funded: no$' "polled while registered but unfunded"
+expect_log resume-fail "Registered\\. Now send 1 SAVDR to $NODE; the install goes on once it arrives\\." "the wait says funding is the step left"
 expect_log resume-fail "Registered: node $NODE is bound to" "binding detected"
+expect_log resume-fail '^Funded: the node holds 1 SAVDR\.$' "funding detected"
 expect_log resume-fail 'could not be started' "failed start explained"
 expect_no_log resume-fail 'Salvorias node installed' "no installed summary after a failed start"
 expect_true "stage is starting, not installed" grep -q '^STAGE=starting$' /etc/salvorias/selfhost.conf
@@ -546,8 +614,16 @@ run resume "$SELF" resume --wait-minutes 1
 expect_rc 0 "second resume starts the service"
 expect_log resume 'Salvorias node installed' "summary printed"
 expect_log resume 'sudo salvorias-selfhost status' "summary uses salvorias-selfhost forms"
-# The node holds 0 SAVDR, so this must warn, whatever the fee is.
-expect_log resume "This node will not check in until it holds some SAVDR\\. Send 1 SAVDR to $NODE\\." "zero-balance warning (node holds 0 SAVDR)"
+expect_log resume 'Balance: +1 SAVDR$' "the summary shows the funded balance"
+expect_no_log resume 'will not check in until it holds' "no zero-balance warning: the install waited for the funds"
+# The service checks in at once (STARTUP_JITTER=0); this mock refuses the
+# transaction, so the result is a failure, reported as a warning only (exit 0).
+expect_log resume '^Watching for the first check-in \(up to 120s' "the install watches for the first check-in"
+expect_log resume '^The first check-in failed: mock-rpc: transactions are disabled in this test\.$' "the first check-in failure, with the node's short reason"
+expect_log resume '^The node keeps retrying on its own schedule\. Run sudo salvorias-selfhost status for details\.$' "the failure says the node keeps retrying"
+expect_log resume "$ACTIVE_NOTE_RE" "the Active note follows the first check-in result"
+expect_true "the Active note comes right after the result" \
+  bash -c "grep -A1 '^The node keeps retrying' '$OUT/resume.log' | tail -n 1 | grep -q '^It can take up to 30 minutes'"
 expect_true "stage is installed" grep -q '^STAGE=installed$' /etc/salvorias/selfhost.conf
 
 section "9. service, files, owners and modes"
@@ -561,6 +637,11 @@ journalctl -u salvorias-node.service --no-pager -n 40 >"$OUT/journal.log" 2>&1 |
 sed 's/^/    | /' "$OUT/journal.log"
 expect_log journal 'Gas Price Mode: +network' "daemon runs in network gas mode"
 expect_log journal "$NODE → owner" "daemon sees its registration"
+# This service run's whole journal, from its start (the excerpt above is the tail).
+journalctl "_SYSTEMD_INVOCATION_ID=$(systemctl show -p InvocationID --value salvorias-node.service)" -o cat --no-pager >"$OUT/journal-run.log" 2>&1 || true
+expect_log journal-run 'Startup Jitter: +0s' "the service starts its first cycle at once (STARTUP_JITTER=0)"
+expect_no_log journal-run 'Startup jitter: sleeping' "no startup delay before the first cycle"
+expect_log journal-run 'check-in failed: ' "the service's first cycle tried to check in (the mock refused it)"
 expect_stat /etc/salvorias "750 root:salvorias"
 expect_stat /etc/salvorias/node.env "640 root:salvorias"
 expect_stat /etc/salvorias/selfhost.conf "640 root:salvorias"
@@ -576,7 +657,7 @@ expect_true "the service user cannot create files in $DATA" bash -c "! runuser -
 expect_true "the service user can still read its key" runuser -u salvorias -- test -r "$DATA/node-key.txt"
 echo "node.env:"; sed 's/^/    | /' /etc/salvorias/node.env
 DAEMON_RPC="$(sed -n 's/^RPC_URL=//p' /etc/salvorias/node.env)"
-for want in "GAS_PRICE_MODE=network" "MAX_GAS_PRICE_GWEI=50" "EXPECTED_CHAIN_ID=7283" \
+for want in "GAS_PRICE_MODE=network" "MAX_GAS_PRICE_GWEI=50" "EXPECTED_CHAIN_ID=7283" "STARTUP_JITTER=0" \
     "NODE_KEYS_FILE=/var/lib/salvorias/node-key.txt" "CHECKIN_CONTRACT=$TESTNET_CHECKIN" \
     "TREASURY_CONTRACT=0x7e8ecebF965dE86fDE7Ebc7F3020813d656CF723"; do
   expect_true "node.env has $want" grep -qx "$want" /etc/salvorias/node.env
@@ -586,10 +667,11 @@ expect_true "unit has no ReadWritePaths" bash -c "! grep -q '^ReadWritePaths' /e
 expect_true "unit is Type=exec" grep -qx 'Type=exec' /etc/systemd/system/salvorias-node.service
 
 section "9b. the daemon attempts a real check-in; the mock receives and blocks it"
-# The service waits up to STARTUP_JITTER (300s) before its first cycle, so
-# this runs the installed binary directly, with the service's own node.env,
-# as the service user, for one cycle and no jitter. The mock reports a
-# 1 SAVDR balance so the daemon has no reason to hold back.
+# The service's own first cycle already ran (section 8 reported its result).
+# This runs the installed binary directly, with the service's own node.env,
+# as the service user, for one more cycle, so the mock's decode of the
+# transaction can be checked field by field. The mock reports a 1 SAVDR
+# balance so the daemon has no reason to hold back.
 mapfile -t DAEMON_ENV < <(grep -E '^[A-Z_]+=' /etc/salvorias/node.env)
 printf '1000000000000000000\n' >"$MOCK_STATE/balance-wei"
 blocked_before=$(grep -c '^BLOCKED eth_sendRawTransaction' "$MOCK_STATE/mock-rpc.log" || true)
@@ -671,7 +753,9 @@ mv "$WORK/saved-lock" "$LOCK"
 section "11. status (unfunded, then funded through the mock)"
 run status "$SELF" status
 expect_rc 0 "status"
-expect_log status 'Binding: +registered to the owner$' "status shows the binding, without a slot number"
+expect_log status '^  Registered: yes \(to the owner\)$' "status shows the registration, without a slot number"
+expect_log status '^  Funded: +NO \(0 SAVDR; send 1 SAVDR to the node address\)$' "status shows the node unfunded"
+expect_no_log status 'show Active in the Salvorias app' "no Active note while the node cannot check in"
 expect_log status "This node will not check in until it holds some SAVDR\\. Send 1 SAVDR to $NODE\\." "status warns while the node holds 0 SAVDR"
 expect_no_log status 'Reserve per check-in|Check-ins left' "status has no reserve or check-ins-left lines"
 expect_log status 'Last 20 log lines' "status shows the journal"
@@ -679,7 +763,9 @@ printf '1000000000000000000\n' >"$MOCK_STATE/balance-wei"
 run status-funded "$SELF" status
 rm -f "$MOCK_STATE/balance-wei"
 expect_rc 0 "status with a balance"
-expect_log status-funded 'Balance: +1 SAVDR' "balance shown in SAVDR"
+expect_log status-funded '^  Registered: yes \(to the owner\)$' "funded status: registered"
+expect_log status-funded '^  Funded: +yes \(1 SAVDR\)$' "funded status: the balance in SAVDR"
+expect_log status-funded "$ACTIVE_NOTE_RE" "status carries the Active note once registered and funded"
 expect_no_log status-funded 'will not check in until it holds' "no zero-balance warning once funded"
 
 section "12. backup-key"
@@ -860,11 +946,25 @@ for spec in node-key.txt:/root/decoy-profile node-address.txt:/root/decoy-disk; 
   expect_true "decoys unchanged: owner, mode, size, links and hash ($name)" decoys_unchanged
   unplant "$name"
 done
-run reinstall-reuse bash "$INSTALL" --network testnet --rpc-url "$MOCK_RPC" --binary "$BIN" --owner "$OWNER"
+# Still registered, but the node holds no SAVDR (section 11 left the mock
+# unfunded): the install shows only the funding box and waits for the funds.
+# The mock then refuses the first check-in the way the chain refuses an
+# address that never held SAVDR.
+printf 'invalid transaction: the sender is not EOA\n' >"$MOCK_STATE/send-error"
+fund_after reinstall-reuse 'registered: yes   funded: no' "$MOCK_STATE" &
+run reinstall-reuse env SALVORIAS_POLL_SECONDS=3 bash "$INSTALL" --network testnet --rpc-url "$MOCK_RPC" --binary "$BIN" --owner "$OWNER" --wait-minutes 2
+wait $! 2>/dev/null || true
+rm -f "$MOCK_STATE/send-error" "$MOCK_STATE/funded-node"
 expect_rc 0 "reinstall with the kept key"
 expect_log reinstall-reuse "kept by an earlier uninstall: $NODE" "kept key reused"
-expect_log reinstall-reuse 'already registered to this wallet' "registration wait skipped"
+expect_log reinstall-reuse 'already registered to this wallet' "no new registration needed"
 expect_no_log reinstall-reuse 'REGISTER THIS NODE' "no registration box"
+expect_log reinstall-reuse '^ FUND THE NODE$' "registered but unfunded: the funding box"
+expect_no_log reinstall-reuse 'STEP 1' "registered but unfunded: no numbered steps"
+expect_log reinstall-reuse '^  [0-9:]{8}  registered: yes   funded: no$' "registered but unfunded: the install waits for the funds"
+expect_log reinstall-reuse '^Funded: the node holds 1 SAVDR\.$' "the funds are detected"
+expect_log reinstall-reuse "^The first check-in failed: the node has no SAVDR yet; send 1 SAVDR to $NODE\\.\$" "a 'not EOA' refusal is explained as missing SAVDR"
+expect_log reinstall-reuse "$ACTIVE_NOTE_RE" "the Active note follows the first check-in result"
 expect_log reinstall-reuse 'Using the system user salvorias that this installer created for an earlier install' "the kept account is known to be the installer's"
 expect_true "state still records the account as created by the installer" grep -qx 'ACCOUNT_CREATED=yes' /etc/salvorias/selfhost.conf
 expect_true "salvorias-selfhost installed from the running file" cmp -s "$SELF" "$INSTALL"
@@ -904,8 +1004,19 @@ expect_rc 2 "junk file refused"
 expect_true "nothing installed after refused imports" nothing_installed
 # Bare hex, no 0x and no trailing newline, is accepted too.
 ( umask 077; tr -d '\n' </root/node-key-backup.txt | sed 's/^0x//' >/root/import-bare.txt )
+# The mock takes this run's first check-in (never forwarding it) and serves a
+# successful receipt, so the daemon logs a confirmed check-in.
+touch "$MOCK_STATE/accept-sends"
 run import bash "$INSTALL" --network testnet --rpc-url "$MOCK_RPC" --binary "$BIN" --owner "$OWNER" --import-key /root/import-bare.txt --self "$WORK/rel-next/install.sh"
+rm -f "$MOCK_STATE/accept-sends"
 expect_rc 0 "import-key install"
+expect_log import 'is registered and holds 1 SAVDR' "registered and funded: the wait is skipped"
+expect_no_log import 'FUND THE NODE|REGISTER THIS NODE|Waiting until' "registered and funded: no boxes and no wait"
+expect_log import '^First check-in confirmed \(tx 0x[0-9a-f]{64}\)\.$' "the first check-in is confirmed"
+CONFIRMED_TX="$(sed -n 's/^First check-in confirmed (tx \(0x[0-9a-f]*\))\.$/\1/p' "$OUT/import.log")"
+expect_true "the confirmed tx is the one the mock took" grep -q "^ACCEPTED-NOT-FORWARDED eth_sendRawTransaction .*hash=${CONFIRMED_TX:-none}\$" "$MOCK_STATE/mock-rpc.log"
+expect_log import "^  https://testnet\\.savscanner\\.io/tx/${CONFIRMED_TX:-none}\$" "the explorer link for the tx"
+expect_log import "$ACTIVE_NOTE_RE" "the Active note follows the first check-in result"
 expect_true "--self file installed as salvorias-selfhost" cmp -s "$SELF" "$WORK/rel-next/install.sh"
 expect_log import "Imported key belongs to node $NODE" "derived address matches the original node"
 expect_log import 'already registered to this wallet' "already bound: registration wait skipped"
@@ -945,8 +1056,12 @@ expect_log import-other 'A different node key' "explains the conflict"
 expect_true "nothing installed by the refused import" test ! -e /etc/salvorias
 ( umask 077; sed 's/^0x//' /root/node-key-backup.txt | tr -d '\n' | tr 'a-f' 'A-F' | sed 's/^/0x/' >/root/import-upper.txt )
 expect_true "the re-import file differs byte-for-byte from the kept key" bash -c "! cmp -s /root/import-upper.txt $DATA/node-key.txt"
+# The mock says the node already qualified for this period.
+touch "$MOCK_STATE/qualified"
 run import-same bash "$INSTALL" --network testnet --rpc-url "$MOCK_RPC" --binary "$BIN" --owner "$OWNER" --import-key /root/import-upper.txt
+rm -f "$MOCK_STATE/qualified"
 expect_rc 0 "the same key in upper-case hex is accepted"
+expect_log import-same '^This node already checked in for the current period; the next check-in is automatic\.$' "an already-qualified node is reported as such"
 expect_log import-same 'same key as the one kept' "recognised as the same key by address"
 expect_true "kept key file unchanged" cmp -s "$DATA/node-key.txt" /root/node-key-backup.txt
 data_layout_ok
@@ -988,14 +1103,15 @@ section "19. no transactions, no key in any output, no slot number in installer 
 slot_hits=$(grep -lE 'Free slot|^ *Slot: +[0-9]|registered to the owner, slot|to this wallet \(slot|is bound to .*\(slot [0-9]' "$OUT"/*.log | grep -v '/slot-info-' || true)
 expect_true "no installer output names a slot number${slot_hits:+ (found in: $slot_hits)}" test -z "$slot_hits"
 blocked=$(grep -c '^BLOCKED' "$MOCK_STATE/mock-rpc.log" || true)
+accepted=$(grep -c '^ACCEPTED-NOT-FORWARDED' "$MOCK_STATE/mock-rpc.log" || true)
 mocked=$(grep -c '^MOCKED' "$MOCK_STATE/mock-rpc.log" || true)
 faithful_blocked=$(grep -c '^BLOCKED' "$FAITHFUL_STATE/mock-rpc.log" || true)
-echo "mock-rpc: $mocked mocked reads, $blocked transaction attempts blocked (faithful mock: $faithful_blocked)"
-grep '^BLOCKED' "$MOCK_STATE/mock-rpc.log" "$FAITHFUL_STATE/mock-rpc.log" | sort | uniq -c | sed 's/^/    /' || true
+echo "mock-rpc: $mocked mocked reads, $blocked transaction attempts blocked, $accepted taken without forwarding (faithful mock: $faithful_blocked blocked)"
+grep -E '^(BLOCKED|ACCEPTED-NOT-FORWARDED)' "$MOCK_STATE/mock-rpc.log" "$FAITHFUL_STATE/mock-rpc.log" | sed 's/ hash=0x[0-9a-f]*$//' | sort | uniq -c | sed 's/^/    /' || true
 expect_true "the daemon was configured with the mock as its only RPC" test "$DAEMON_RPC" = "$MOCK_RPC"
 # Until section 8 no daemon had ever used this mock, so anything blocked by
 # then would have come from the installer itself.
-before_daemon=$(head -n "$MOCK_LINES_AT_START" "$MOCK_STATE/mock-rpc.log" | grep -c '^BLOCKED' || true)
+before_daemon=$(head -n "$MOCK_LINES_AT_START" "$MOCK_STATE/mock-rpc.log" | grep -cE '^(BLOCKED|ACCEPTED)' || true)
 expect_true "the installer itself never tried to send a transaction" test "$before_daemon" = 0
 # Read from the real testnet, not a mock: a node wallet that ever had a
 # transaction mined would have a nonce above 0.

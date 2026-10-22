@@ -6,8 +6,9 @@ license you hold.
 One script, `install.sh`, sets up **one node per server**. It:
 - downloads and verifies the node binary;
 - creates the node's wallet key on your server;
-- waits while you register the node in the Salvorias app;
-- runs the node as a locked-down systemd service.
+- waits while you fund the node and register it in the Salvorias app;
+- runs the node as a locked-down systemd service, and reports its first
+  check-in.
 
 After install, you manage the node with `sudo salvorias-selfhost <command>`.
 
@@ -83,18 +84,23 @@ The default network is **mainnet**. To try it on testnet first, add
    - If the wallet holds no license, it stops. Nothing has been installed
      yet.
    - If every license already has a node, it carries on. The registration
-     box says so, and the app asks you to confirm which node is replaced.
+     step says so, and the app asks you to confirm which node is replaced.
 5. **Sets up the server.** It creates:
    - a `salvorias` system user;
    - the directories;
    - the node key;
    - `salvorias-selfhost`, the command you use to manage the node later.
-6. **Shows the registration box** with your node address and where to
-   register it:
+6. **Shows two steps**, funding first:
+   - **STEP 1: FUND THE NODE** shows your node address. Send 1 SAVDR to it
+     (the node pays a tiny fee for each daily check-in, so 1 SAVDR will last
+     a while), and keep a little SAVDR in your wallet (0.01 is plenty) to send
+     the registration. An address with no SAVDR cannot check in at all, even
+     when fees are zero.
+   - **STEP 2: REGISTER THIS NODE IN THE SALVORIAS APP**:
 
    > Open https://app.salvorias.com/licenses/self-host (or Salvorias app >
-   > Licenses > Self Setup), paste this node address and confirm with your
-   > passcode.
+   > Licenses > Self Setup), paste the node address from step 1 and confirm
+   > with your passcode.
 
    On testnet the link is https://app.dev.salvorias.com/licenses/self-host.
    You never choose which license the node goes on: the app picks. It uses a
@@ -107,22 +113,40 @@ The default network is **mainnet**. To try it on testnet first, add
    > you which node this replaces, and asks you to confirm before moving a
    > node off Save Hosting.
 
-   It also tells you what to fund: send 1 SAVDR to the node address (the node
-   pays a tiny fee for each daily check-in, so 1 SAVDR will last a while), and
-   keep a little SAVDR in your wallet (0.01 is plenty) to send the
-   registration. An address with no SAVDR cannot check in at all, even when
-   fees are zero.
-7. **Waits for the registration** to appear on-chain. It checks every 15
-   seconds, for up to 30 minutes by default (`--wait-minutes N`).
-   - Ctrl-C is safe. Your node key is kept, and you continue later with
-     `sudo salvorias-selfhost resume`.
+   With a node that is already registered (a key kept on this server, or one
+   you import), only the funding box is shown, and nothing at all once the
+   node holds SAVDR.
+7. **Waits until the node is both funded and registered** on-chain. It checks
+   every 15 seconds, for up to 30 minutes by default (`--wait-minutes N`), and
+   prints a line such as `12:06:12  registered: no   funded: yes` when that
+   changes (and once a minute otherwise). The service is not started until
+   both are done.
+   - Ctrl-C is safe. It says which step is still missing; your node key is
+     kept, and you continue later with `sudo salvorias-selfhost resume`.
 8. **Starts the node** as the `salvorias-node` systemd service, enabled at
-   boot, then prints a summary.
+   boot. The node checks in right away (`STARTUP_JITTER=0` in `node.env`).
    - If the service cannot be started, the install is not marked finished:
      fix the problem it shows, then run `sudo salvorias-selfhost resume`.
-   - If the node holds no SAVDR, it warns you: "This node will not check in
-     until it holds some SAVDR." It also warns if the balance is below what
-     the chain requires to accept a check-in.
+9. **Watches for the first check-in** for up to 2 minutes, then prints one
+   of:
+   - `First check-in confirmed (tx 0x…).`, with a link to the transaction on
+     savscanner.io (testnet.savscanner.io on testnet);
+   - `This node already checked in for the current period; the next check-in
+     is automatic.`;
+   - `The first check-in failed: <reason>.` The node keeps retrying on its
+     own schedule; `sudo salvorias-selfhost status` shows the details. A
+     node with no SAVDR shows as "the node has no SAVDR yet; send 1 SAVDR to
+     <address>";
+   - `No check-in result yet; run sudo salvorias-selfhost status in a few
+     minutes.`
+
+   Then: "It can take up to 30 minutes for your license to show Active in
+   the Salvorias app after the first check-in. Check back then."
+
+   Ctrl-C ends this watch only: the node keeps running and the install is
+   finished. A failed first check-in is a warning, never an install error.
+   A summary follows. It warns if the balance is below what the chain
+   requires to accept a check-in.
 
 ### Non-interactive install
 
@@ -134,8 +158,8 @@ sudo bash install.sh --owner 0xYourLicenseWalletAddress --wait-minutes 60
 
 | Command | What it does |
 | --- | --- |
-| `sudo salvorias-selfhost status` | Service state, version, node address, whether it is registered, balance (with a warning while it is 0), last 20 log lines |
-| `sudo salvorias-selfhost resume` | Continue an install that was waiting for registration, or whose service did not start |
+| `sudo salvorias-selfhost status` | Service state, version, node address, `Registered:` and `Funded:` (with the balance, and a warning while it is 0), the note on when the license shows Active, last 20 log lines |
+| `sudo salvorias-selfhost resume` | Continue an install that was waiting for funding and registration, or whose service did not start |
 | `sudo salvorias-selfhost upgrade [--version vX]` | Download and verify a newer node release, switch to it, restart. If the service is not running steadily after 30 seconds, or you press Ctrl-C while it watches, it switches back to the previous version. Also updates `salvorias-selfhost` itself. With the binary already current, it restarts a stopped service, and it brings an install made by an older installer to the current file layout. |
 | `sudo salvorias-selfhost upgrade --rollback` | Switch back to the version kept by the last upgrade, restart and watch it. Run it again to go forward. |
 | `sudo salvorias-selfhost backup-key [--out PATH]` | Copy the node key to a root-only file (mode 0600) for offline storage. It never prints the key. |
@@ -166,6 +190,7 @@ SAVDR is the network's fee token, and it is needed in two places.
 
 On Salvorias an address that has never held SAVDR does not exist on chain, so
 a node with a zero balance can never check in, even when the network fee is 0.
+The installer waits for the node to hold SAVDR before it starts the service.
 `status` shows the node balance and warns while it is 0. The node never pays
 more than 50 gwei per unit of gas (see Configuration below).
 
@@ -194,8 +219,9 @@ Anyone with the key controls the node wallet and the SAVDR on it.
    ```
 
    The installer reads the node address from the key, and you do not need to
-   register again: the node is already registered to your wallet. It then
-   starts the service.
+   register again: the node is already registered to your wallet. If the
+   node still holds SAVDR, it then starts the service; otherwise it asks you
+   to fund the node first.
 4. Delete the copy you imported (`sudo shred -u <file>`), as the summary
    reminds you.
 
@@ -248,6 +274,7 @@ created the account.
 | --- | --- |
 | `CHECKIN_CONTRACT`, `TREASURY_CONTRACT`, `EXPECTED_CHAIN_ID`, `RPC_URL` | Set for the chosen network |
 | `NODE_KEYS_FILE` | `/var/lib/salvorias/node-key.txt` |
+| `STARTUP_JITTER` | `0`: the first check-in runs as soon as the service starts. The daemon's default random delay (up to 300 seconds) is for spreading out a hosted fleet. |
 | `GAS_PRICE_MODE` | `network`. Required: self-hosted node wallets are not fee-exempt. |
 | `MAX_GAS_PRICE_GWEI` | `50`. The most the node pays per unit of gas. Raise it if check-ins stall during a long fee spike. |
 
@@ -260,6 +287,7 @@ created the account.
 | NodeCheckIn | `0x88ac542c7B8a2952f704B0ed24CFC17F64527D8D` | `0x51F6122C6014866Bd9443E21b05033b195A1fF27` |
 | License NFT | `0xc01E4070A3BBBe79b03bB4b11479C5D39aFE1E87` | `0xa1CF5786c6ceC9E8D0BbACEdF2cc98dAe4614363` |
 | Treasury | `0xDEfad8fE8Af1ef0B8d0D00251A80391c9Ed04243` | `0x7e8ecebF965dE86fDE7Ebc7F3020813d656CF723` |
+| Explorer | https://savscanner.io | https://testnet.savscanner.io |
 
 `--rpc-url` points the installer and the node at a different RPC endpoint for
 the same network. It must be `https://` with a plain host name and path (no
@@ -293,8 +321,9 @@ uninstall          --yes  --purge-key
 | --- | --- | --- |
 | `SALVORIAS_RELEASE_BASE_URL` | GitHub Releases (`.../releases/download/<tag>`, or `.../releases/latest/download`) | Where the binaries, `install.sh` and `checksums.txt` are downloaded from |
 | `SALVORIAS_WAIT_MINUTES` | 30 | Default for `--wait-minutes` |
-| `SALVORIAS_POLL_SECONDS` | 15 | Registration poll interval |
+| `SALVORIAS_POLL_SECONDS` | 15 | Funding and registration poll interval |
 | `SALVORIAS_UPGRADE_WATCH_SECONDS` | 30 | How long `upgrade` watches the new version before keeping it (at least 10) |
+| `SALVORIAS_FIRST_CHECKIN_SECONDS` | 120 | How long `install` and `resume` watch for the first check-in's result (0 to 3600; 0 skips the watch) |
 | `SALVORIAS_RELEASE_REPO` | `NodeSolutionsAI/salvorias-node-selfhost` | GitHub `owner/name` for release downloads (letters, digits, `.`, `_`, `-`) |
 
 Exit codes:
@@ -304,7 +333,7 @@ Exit codes:
 | 0 | OK |
 | 1 | Error |
 | 2 | Bad usage or input |
-| 3 | Stopped: something to do outside the server (no license, not registered yet) |
+| 3 | Stopped: something to do outside the server (no license, not funded or registered yet) |
 | 4 | Another `salvorias-selfhost` command is running on this server |
 | 130 | Interrupted |
 
@@ -317,8 +346,14 @@ Exit codes:
   confirm before moving a node off Save Hosting. If that node is on Save
   Hosting, your Save Hosting billing does not change by itself: contact
   support to reduce it.
-- **The registration wait timed out**: nothing is lost. Register the node in
-  the app, then run `sudo salvorias-selfhost resume`.
+- **The wait timed out**: nothing is lost. The message says what is still
+  missing: fund the node (send 1 SAVDR to the node address), register it in
+  the app, or both. Then run `sudo salvorias-selfhost resume`.
+- **"The first check-in failed"**: the node keeps running and retries on its
+  own schedule. Run `sudo salvorias-selfhost status` for the log lines. "The
+  node has no SAVDR yet" means the funds have not reached the node address.
+- **The license does not show Active yet**: it can take up to 30 minutes
+  after the first check-in. Check back then.
 - **The service keeps restarting**: run `sudo salvorias-selfhost status` and
   read the log lines. The node exits if its key is not registered on-chain.
 - **"This node will not check in until it holds some SAVDR"**: send 1 SAVDR

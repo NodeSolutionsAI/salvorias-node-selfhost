@@ -18,7 +18,15 @@ bash tests/unit-math.sh      # needs bash 4.4+; the e2e suite also runs it in th
 These extract the pure helpers from `install.sh` and test them: wei
 formatting, whole-number validation (no leading zeros such as `08`, which
 bash arithmetic reads as invalid octal), the funding text (send 1 SAVDR to the node, the wallet line, no "cost nothing today" or reserve math) and the unfunded warning, the
-URL and repo rules, `checksums.txt` parsing (empty file, missing entry,
+box order (fund first, then register; the address and wallet line in step 1)
+and the missing-step messages, the first check-in parsing (confirmed, already
+qualified, failed, the fee-cap skip, and what stays pending), the failure
+reasons (a "not EOA" or "insufficient funds" refusal becomes "the node has no
+SAVDR yet", ethers' wrapper is cut down to the node's message), the result
+lines with the explorer link and the Active note, and the watch itself with
+stand-ins for systemctl and journalctl (it ends on a result, times out within
+its bound, never changes the exit code, and Ctrl-C ends the watch but not the
+install), the URL and repo rules, `checksums.txt` parsing (empty file, missing entry,
 `*name` entries, CRLF, conflicting entries), the ELF header check, and the
 version-name pattern (no `..`, leading dot or dash, or slash), the
 `openSlots` reader (a missing or malformed list stops the install; only `[]`
@@ -137,16 +145,29 @@ messages, files, owners and modes.
     file named `main` that carries the installer marker. bash names a piped
     script `main`; the test checks that file is not installed, and that
     `salvorias-selfhost` comes from the release's verified `install.sh`;
-  - the registration wait timing out (exit 3), with the funding text (1 SAVDR to the node, a little in the wallet);
+  - the boxes in order (STEP 1: FUND THE NODE, then STEP 2: REGISTER THIS
+    NODE IN THE SALVORIAS APP), and the wait timing out (exit 3), with the
+    funding text (1 SAVDR to the node, a little in the wallet). The owner
+    funds the node during the wait but never registers it: the progress goes
+    from `registered: no   funded: no` to `registered: no   funded: yes`, and
+    the timeout names the missing registration. (Section 4c's timeout names
+    both; section 4b's checks that an unchanging state prints one line, not
+    one per poll.);
   - the one-node guard while the install waits;
-  - Ctrl-C during `resume`;
-  - `resume` while the owner "registers" the node mid-wait, with the service
-    start forced to fail (a drop-in with `ExecStartPre=/bin/false`): the
+  - Ctrl-C during `resume`, which names both missing steps;
+  - `resume` while the owner "registers" the node mid-wait and funds it
+    later. While it is registered but unfunded, the install keeps waiting,
+    with no unit file, no `node.env` and no service. Then the service
+    start is forced to fail (a drop-in with `ExecStartPre=/bin/false`): the
     install stays at stage `starting`. Then a daemon that starts and crashes
     3 seconds later, inside the post-start watch (the `broken/` binary run
     through a drop-in): the install still stays at `starting`. A last
-    `resume` starts it;
-  - the running service: active, enabled, no restarts, network gas mode;
+    `resume` starts it, and reports the first check-in, which the mock
+    refuses: `The first check-in failed: mock-rpc: transactions are disabled
+    in this test.`, the retry line and the Active note, with exit 0;
+  - the running service: active, enabled, no restarts, network gas mode, and
+    `STARTUP_JITTER=0`: this run's journal shows no startup delay and a
+    check-in attempt;
   - every file mode and owner, including the root-owned data directory that
     the service user cannot write to, the system user, `node.env`, and a unit
     file with `Type=exec` and no `ReadWritePaths`;
@@ -163,7 +184,9 @@ messages, files, owners and modes.
     while `status` still runs. A link at the lock path is refused and its
     target is untouched. During the Ctrl-C upgrade test below, an
     `uninstall --yes` started while the upgrade runs is refused the same way;
-  - `status`, unfunded (zero-balance warning) and funded;
+  - `status`, unfunded (`Funded: NO`, the zero-balance warning, no Active
+    note) and funded (`Registered: yes`, `Funded: yes (1 SAVDR)`, the Active
+    note);
   - `backup-key`: to a fresh path in a new root-only directory (0600
     root:root, no temp file left), and refused into a symlinked directory,
     a directory another user owns and a world-writable one;
@@ -190,24 +213,35 @@ messages, files, owners and modes.
     created (by UID), so the reinstall below still records the account as
     the installer's;
   - planted links stop a reinstall, with the decoys untouched;
-  - a reinstall that reuses the kept key;
+  - a reinstall that reuses the kept key while the node is registered but
+    unfunded: only the funding box, `registered: yes   funded: no` until the
+    owner funds it, then a first check-in that the mock refuses as the chain
+    does ("the sender is not EOA"), shown as `the node has no SAVDR yet; send
+    1 SAVDR to <node>`;
   - `uninstall --purge-key`, once with a wrong confirmation and once with the
     right one, which deletes the account the installer created;
   - `install --import-key`: a world-readable file, a link, a two-key file and
     a junk file are each refused, then a bare-hex key is imported and the
-    registration wait is skipped because the node is already bound;
+    wait is skipped because the node is already registered and funded. The
+    mock takes this run's check-in without forwarding it and serves a
+    receipt: `First check-in confirmed (tx 0x…).`, with the tx the mock took
+    and its testnet.savscanner.io link;
   - `uninstall` while the service refuses to stop (a `RefuseManualStop=yes`
     drop-in): it fails and removes nothing. Then `uninstall` with the unit
     file deleted while the service is still loaded and running: the service
     is stopped and unloaded, and no boot link is left;
   - with a key kept by an uninstall: a different key is refused, and the
-    same key in upper-case hex (different bytes) is accepted by address;
+    same key in upper-case hex (different bytes) is accepted by address. The
+    mock answers that the node already qualified this period: `This node
+    already checked in for the current period; the next check-in is
+    automatic.`;
   - a final purge with leftovers of an interrupted run planted (temp copies
     of `salvorias-selfhost` and the unit file, a staging directory), which
     removes them and leaves a clean server.
 - **Leak checks:**
   - the installer itself never tried to send a transaction, and no send
-    reached the chain (every attempt was refused by a mock);
+    reached the chain (every attempt was refused, or taken without
+    forwarding, by a mock);
   - no node key appears in any captured output or journal line, and the
     fake typed key appears in no captured log;
   - no "unit file changed on disk" warning appears in any captured output.
@@ -222,13 +256,21 @@ against the chain directly. `tests/mock-rpc.py` is a small JSON-RPC proxy:
   itself. The binding appears when the test writes the node address to
   `<state-dir>/bound-node`, which plays the owner registering the node in the
   app. `<state-dir>/replaced-by` plays the app putting another node on that
-  license afterwards.
+  license afterwards. `<state-dir>/balance-wei` is the bound node's balance,
+  and also that of the address in `<state-dir>/funded-node`, which plays the
+  owner funding the node before registering it. `<state-dir>/qualified`
+  makes `isNodeQualified` answer true.
 - With `--fee-wei` it pins `eth_gasPrice` and `eth_maxPriorityFeePerGas`, so
   the non-zero fee paths run whatever the testnet fee is that day.
-- It **refuses `eth_sendRawTransaction` and `eth_sendTransaction`**, so
-  nothing in the test can send a transaction. A refused raw transaction is
-  decoded and its type, chain, nonce, fee fields, gas limit, target and
-  selector are logged (never the signature).
+- It **never forwards `eth_sendRawTransaction` or `eth_sendTransaction`**,
+  so nothing in the test can send a transaction. By default it refuses them
+  (with the text of `<state-dir>/send-error` as the error, if that exists).
+  A raw transaction is decoded and its type, chain, nonce, fee fields, gas
+  limit, target and selector are logged (never the signature). While
+  `<state-dir>/accept-sends` exists it answers the transaction's real hash
+  instead (Keccak-256, in the mock itself) and serves a successful receipt
+  for it, still without forwarding anything, so the daemon logs a confirmed
+  check-in.
 - With `--emulate-node-to-slot` it also answers `nodeToSlot`.
   - The mainnet NodeCheckIn implementation has that getter. The testnet
     deployment (`0x51F6…1fF27`) does not; there salvorias-node 0.0.9+ finds
@@ -251,3 +293,4 @@ attempt runs the installed binary directly instead of through the installer.
 | `SALVORIAS_RELEASE_BASE_URL` | Local `python3 -m http.server` releases, including tampered and malformed ones |
 | `SALVORIAS_POLL_SECONDS` | Faster registration polling |
 | `SALVORIAS_UPGRADE_WATCH_SECONDS` | Upgrade watch window (default 30, minimum 10) |
+| `SALVORIAS_FIRST_CHECKIN_SECONDS` | First check-in watch (default 120; the unit tests use 0, 3, 30 and 60) |

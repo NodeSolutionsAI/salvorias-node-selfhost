@@ -36,6 +36,9 @@ SALVORIAS_RELEASE_BASE_URL="${SALVORIAS_RELEASE_BASE_URL:-}"
 SALVORIAS_WAIT_MINUTES="${SALVORIAS_WAIT_MINUTES:-30}"
 SALVORIAS_POLL_SECONDS="${SALVORIAS_POLL_SECONDS:-15}"
 SALVORIAS_UPGRADE_WATCH_SECONDS="${SALVORIAS_UPGRADE_WATCH_SECONDS:-30}"
+# How long the install watches the journal for the first check-in's outcome.
+# 0 skips the watch.
+SALVORIAS_FIRST_CHECKIN_SECONDS="${SALVORIAS_FIRST_CHECKIN_SECONDS:-120}"
 MIN_UPGRADE_WATCH_SECONDS=10
 
 # ─── Fixed layout ──────────────────────────────────────────────────────────
@@ -103,7 +106,7 @@ USAGE
 
 COMMANDS
   install          Set up the node (default command)
-  resume           Continue an install that was waiting for registration
+  resume           Continue an install that was waiting for funding and registration
   status           Service state, version, registration, balance, recent logs
   upgrade          Install a newer node binary; rolls back if it fails to run.
                    Also restarts a stopped service and repairs file ownership
@@ -115,7 +118,7 @@ INSTALL OPTIONS
   --network NAME           mainnet (default) or testnet
   --rpc-url URL            Use a different RPC endpoint for that network
   --version vX             Node release tag to install (default: latest)
-  --wait-minutes N         How long to wait for registration (default: $SALVORIAS_WAIT_MINUTES)
+  --wait-minutes N         How long to wait for funding and registration (default: $SALVORIAS_WAIT_MINUTES)
   --import-key PATH        Use an existing node key (from backup-key) instead
                            of generating a new one. For moving a node to a new
                            server. The file must not be group/world readable.
@@ -138,13 +141,15 @@ OTHER OPTIONS
 ENVIRONMENT
   SALVORIAS_RELEASE_BASE_URL   Base URL holding the release assets and checksums.txt
   SALVORIAS_WAIT_MINUTES       Default for --wait-minutes
-  SALVORIAS_POLL_SECONDS       Registration poll interval (default 15)
+  SALVORIAS_POLL_SECONDS       Funding and registration poll interval (default 15)
   SALVORIAS_UPGRADE_WATCH_SECONDS  How long upgrade watches the new version
                                before keeping it (default 30, minimum 10)
+  SALVORIAS_FIRST_CHECKIN_SECONDS  How long install watches for the first
+                               check-in's result (default 120, 0 skips it)
 
 EXIT CODES
   0 ok   1 error   2 bad usage or input   3 stopped: something to do outside
-  this server (no license, not registered yet)   4 another salvorias-selfhost
+  this server (no license, not funded or registered yet)   4 another salvorias-selfhost
   command is running   130 interrupted
 EOF
 }
@@ -161,6 +166,7 @@ set_network() {
       NET_NFT="0xc01E4070A3BBBe79b03bB4b11479C5D39aFE1E87"
       NET_TREASURY="0xDEfad8fE8Af1ef0B8d0D00251A80391c9Ed04243"
       NET_APP_URL="https://app.salvorias.com"
+      NET_EXPLORER_URL="https://savscanner.io"
       ;;
     testnet)
       NET_RPC_URL="https://testnet.salvorias.net"
@@ -171,6 +177,7 @@ set_network() {
       # The dev portal is the one built for chain 7283 (its bundle points at
       # testnet.salvorias.net); the production portal only knows mainnet.
       NET_APP_URL="https://app.dev.salvorias.com"
+      NET_EXPLORER_URL="https://testnet.savscanner.io"
       ;;
     *)
       usage_error "Unknown network '$1'. Use mainnet or testnet."
@@ -1307,23 +1314,40 @@ warn_if_unfunded() {
   fi
 }
 
-# print_registration_box OPEN_SLOTS: OPEN_SLOTS is slot-info's openSlots list.
-# Slot numbers are never shown: the app picks the slot itself. The list only
-# decides whether to say that registering will replace an existing node.
-print_registration_box() {
-  local slots="$1"
-  say ""
-  rule
-  say " STEP 1: REGISTER THIS NODE IN THE SALVORIAS APP"
-  rule
+# True when a wei amount from slot-info is above zero. Any SAVDR at all is
+# enough to stop waiting: the chain then knows the address (see
+# print_funding), and warn_if_unfunded still flags a balance below the fee.
+has_balance() { is_uint "$1" && [[ "$(strip_zeros "$1")" != "0" ]]; }
+
+print_node_address() {
   say ""
   say "   Node address:"
   say ""
   say "     $NODE_ADDRESS"
   say ""
+}
+
+# print_setup_boxes OPEN_SLOTS: OPEN_SLOTS is slot-info's openSlots list.
+# Funding comes first: an address that has never held SAVDR does not exist
+# on chain, so the node cannot check in until it is funded, whatever the app
+# shows. Slot numbers are never shown: the app picks the slot itself. The list
+# only decides whether to say that registering will replace an existing node.
+print_setup_boxes() {
+  local slots="$1"
+  say ""
+  rule
+  say " STEP 1: FUND THE NODE"
+  rule
+  print_node_address
+  print_funding
+  say ""
+  rule
+  say " STEP 2: REGISTER THIS NODE IN THE SALVORIAS APP"
+  rule
+  say ""
   say "   Open $NET_APP_URL/licenses/self-host"
-  say "   (or Salvorias app > Licenses > Self Setup), paste this node address"
-  say "   and confirm with your passcode."
+  say "   (or Salvorias app > Licenses > Self Setup), paste the node address"
+  say "   from step 1 and confirm with your passcode."
   if [[ -z "$slots" ]]; then
     say ""
     say "   All your licenses already have a node. When you register, the app"
@@ -1332,45 +1356,95 @@ print_registration_box() {
   fi
   say ""
   rule
-  say " STEP 2: FUND THE NODE"
+  say ""
+}
+
+# For a node that is already registered (a kept or imported key) but holds
+# no SAVDR: funding is the only step left.
+print_funding_box() {
+  say ""
   rule
+  say " FUND THE NODE"
+  rule
+  say "   Node address: $NODE_ADDRESS"
   print_funding
   rule
   say ""
 }
 
-# Polls until the node is bound to the owner. Ctrl-C or a timeout leaves the
-# install resumable: the key and state file are already written.
-wait_for_binding() {
-  local minutes="$1" deadline now rc
+# Sets NODE_REGISTERED and NODE_FUNDED (yes or no) from SLOT_JSON. A node
+# registered to another wallet stops the install: waiting cannot fix that.
+read_readiness() {
+  read_binding
+  if [[ "$BOUND_STATE" == "other" ]]; then
+    die "Node $NODE_ADDRESS was registered to a different wallet ($BOUND_OTHER), not $OWNER. Remove it from that wallet's licenses in the app (signed in with $BOUND_OTHER), then run: $(cmd_hint uninstall) and install again with the right owner."
+  fi
+  NODE_REGISTERED=no
+  if [[ "$BOUND_STATE" == "owner" ]]; then NODE_REGISTERED=yes; fi
+  NODE_FUNDED=no
+  if has_balance "$(json_str nodeBalanceWei)"; then NODE_FUNDED=yes; fi
+}
+NODE_REGISTERED=""
+NODE_FUNDED=""
+
+# missing_steps REGISTERED FUNDED: names what is still to do, for the Ctrl-C
+# and timeout messages. Empty values mean the chain has not been read yet.
+missing_steps() {
+  local fund="send 1 SAVDR to $NODE_ADDRESS"
+  local reg="register it in the app (Licenses > Self Setup, node address $NODE_ADDRESS)"
+  case "$1/$2" in
+    no/no) printf 'The node is not funded and not registered yet: %s, and %s.' "$fund" "$reg" ;;
+    yes/no) printf 'The node is registered but not funded yet: %s.' "$fund" ;;
+    no/yes) printf 'The node is funded but not registered yet: %s.' "$reg" ;;
+    *) printf 'The chain could not be read, so funding and registration are unconfirmed. Make sure the node is funded (%s) and registered (%s).' "$fund" "$reg" ;;
+  esac
+}
+
+# Polls until the node is BOTH registered to the owner and funded: starting
+# the service earlier only produces failed check-ins. Prints a progress line
+# when the state changes, and otherwise once a minute. Ctrl-C or a timeout
+# leaves the install resumable: the key and state file are already written.
+wait_until_ready() {
+  local minutes="$1" deadline now rc line last_line="" last_print=0
   deadline=$(( $(date +%s) + minutes * 60 ))
-  INTERRUPT_HINT="Your node key is saved. Once the node is registered in the app, continue with:
+  NODE_REGISTERED=""
+  NODE_FUNDED=""
+  INTERRUPT_HINT="Your node key is saved. Once the node is funded and registered, continue with:
   $(cmd_hint resume)"
-  say "Waiting for the registration to appear on-chain (checking every ${SALVORIAS_POLL_SECONDS}s, up to $minutes min)."
+  say "Waiting until the node is funded and registered on-chain (checking every ${SALVORIAS_POLL_SECONDS}s, up to $minutes min)."
   say "You can press Ctrl-C and continue later with: $(cmd_hint resume)"
   while :; do
     rc=0
     run_slot_info "$PATH_LINK" "$NODE_ADDRESS" || rc=$?
-    if (( rc == 0 )); then
-      read_binding
-      case "$BOUND_STATE" in
-        owner)
-          say "Registered: node $NODE_ADDRESS is bound to $OWNER."
-          INTERRUPT_HINT=""
-          return 0
-          ;;
-        other)
-          die "Node $NODE_ADDRESS was registered to a different wallet ($BOUND_OTHER), not $OWNER. Remove it from that wallet's licenses in the app (signed in with $BOUND_OTHER), then run: $(cmd_hint uninstall) and install again with the right owner."
-          ;;
-      esac
-      say "  $(date +%H:%M:%S)  not registered yet"
-    else
-      say "  $(date +%H:%M:%S)  could not read the chain ($(json_str error)); will retry"
-    fi
     now=$(date +%s)
+    if (( rc == 0 )); then
+      read_readiness
+      if [[ "$NODE_REGISTERED" == yes && "$NODE_FUNDED" == yes ]]; then
+        INTERRUPT_HINT=""
+        say "Registered: node $NODE_ADDRESS is bound to $OWNER."
+        say "Funded: the node holds $(wei_to_savdr "$(json_str nodeBalanceWei)") SAVDR."
+        return 0
+      fi
+      line="registered: $NODE_REGISTERED   funded: $NODE_FUNDED"
+      INTERRUPT_HINT="Your node key is saved. $(missing_steps "$NODE_REGISTERED" "$NODE_FUNDED") Then continue with:
+  $(cmd_hint resume)"
+    else
+      line="could not read the chain ($(json_str error)); will retry"
+    fi
+    if [[ "$line" != "$last_line" ]] || (( now - last_print >= 60 )); then
+      say "  $(date +%H:%M:%S)  $line"
+      if [[ "$line" != "$last_line" ]]; then
+        case "$line" in
+          "registered: yes   funded: no") say "            Registered. Now send 1 SAVDR to $NODE_ADDRESS; the install goes on once it arrives." ;;
+          "registered: no   funded: yes") say "            Funded. Now register the node in the app (step 2); the install goes on once the registration is on-chain." ;;
+        esac
+      fi
+      last_line="$line"
+      last_print=$now
+    fi
     if (( now >= deadline )); then
       INTERRUPT_HINT=""
-      stop "The node was not registered within $minutes minutes. Your node key is saved. Register it in the app (Licenses > Self Setup, node address $NODE_ADDRESS), then run: $(cmd_hint resume)"
+      stop "Waited $minutes min. $(missing_steps "$NODE_REGISTERED" "$NODE_FUNDED") Your node key is saved. Then run: $(cmd_hint resume)"
     fi
     sleep "$SALVORIAS_POLL_SECONDS"
   done
@@ -1390,6 +1464,10 @@ RPC_URL=$RPC_URL
 TREASURY_CONTRACT=$NET_TREASURY
 EXPECTED_CHAIN_ID=$NET_CHAIN_ID
 NODE_KEYS_FILE=$KEY_FILE
+# Check in as soon as the service starts. The daemon's default random delay
+# (up to 300s) spreads a hosted fleet's restarts; a single self-hosted node
+# has nothing to spread, and the installer watches for the first result.
+STARTUP_JITTER=0
 # Self-hosted node wallets are not fee-exempt: pay the live network fee,
 # never more than MAX_GAS_PRICE_GWEI per unit of gas.
 GAS_PRICE_MODE=$GAS_PRICE_MODE
@@ -1479,6 +1557,131 @@ show_journal() {
   journalctl -u "$UNIT_NAME" -n "${1:-20}" --no-pager 2>/dev/null || say "(no journal entries)"
 }
 
+# ─── First check-in ────────────────────────────────────────────────────────
+
+ACTIVE_NOTE="It can take up to 30 minutes for your license to show Active in the Salvorias app after the first check-in. Check back then."
+
+# Reads the daemon's journal lines (as `journalctl -o cat` prints them) on
+# stdin and prints the first check-in's outcome, or nothing while there is
+# none yet:
+#   confirmed HASH   "TX Hash: 0x…" followed by "Confirmed block …"
+#   done             already qualified for this period, or checked in too
+#                    recently: nothing to send
+#   failed REASON    "… check-in failed: REASON"
+#   skipped LINE     the fee-cap skip line, without the log prefix
+# Only these phrases of checkin-multi-agent.js are parsed. "check-in failed"
+# and "Confirmed block" are also what the hosting node-agent parses, so they
+# are kept stable; the others are the daemon's fixed status lines. Anything
+# else (a failed cycle, an RPC outage) stays pending and ends in the timeout
+# line, which points at status.
+first_checkin_outcome() {
+  local line msg hash=""
+  local prefix_re='^\[[^]]*\] \[[A-Z ]*\] *(.*)$'
+  local hash_re='TX Hash: (0x[0-9a-fA-F]{64})([^0-9a-fA-F]|$)'
+  local done_re='Status: [1-9][0-9]* already qualified, 0 need check-in'
+  local failed_re='check-in failed: (.*)$'
+  while IFS= read -r line; do
+    msg="$line"
+    if [[ "$line" =~ $prefix_re ]]; then msg="${BASH_REMATCH[1]}"; fi
+    msg="${msg#"${msg%%[![:space:]]*}"}"
+    if [[ "$msg" =~ $hash_re ]]; then
+      hash="${BASH_REMATCH[1]}"
+    elif [[ -n "$hash" && "$msg" == "Confirmed block "[0-9]* ]]; then
+      printf 'confirmed %s\n' "$hash"
+      return 0
+    elif [[ "$msg" =~ $done_re || "$msg" == *"All nodes checked in for this period."* || "$msg" == *"checked in too recently. OK."* ]]; then
+      printf 'done\n'
+      return 0
+    elif [[ "$msg" =~ $failed_re ]]; then
+      printf 'failed %s\n' "${BASH_REMATCH[1]}"
+      return 0
+    elif [[ "$msg" == *" skipped this cycle: "* ]]; then
+      printf 'skipped %s\n' "$msg"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# checkin_failure_reason RAW: a short reason from the daemon's error text.
+# An address that never held SAVDR is refused as "not EOA", and a short
+# balance as "insufficient funds": both mean the node needs SAVDR. Otherwise
+# ethers' wrapper ("could not coalesce error (error={ … "message": "…" },
+# payload=…)") is cut down to the node's own message. Control characters are
+# dropped: the text comes from an RPC server.
+checkin_failure_reason() {
+  local raw="$1" re='"message": ?"([^"]*)"'
+  if [[ "${raw,,}" == *"not eoa"* || "${raw,,}" == *insufficient* ]]; then
+    printf 'the node has no SAVDR yet; send 1 SAVDR to %s' "$NODE_ADDRESS"
+    return 0
+  fi
+  if [[ "$raw" =~ $re ]]; then
+    raw="${BASH_REMATCH[1]}"
+  else
+    raw="${raw%% (*}"
+  fi
+  raw="${raw//[^[:print:]]/}"
+  raw="${raw:0:200}"
+  while [[ "$raw" == *[.\ ] ]]; do raw="${raw%?}"; done
+  printf '%s' "${raw:-no reason given}"
+}
+
+# Prints the result line for an outcome from first_checkin_outcome (empty:
+# none within the watch).
+print_first_checkin() {
+  local kind="${1%% *}" rest="${1#* }"
+  case "$kind" in
+    confirmed)
+      say "First check-in confirmed (tx $rest)."
+      say "  $NET_EXPLORER_URL/tx/$rest"
+      ;;
+    done)
+      say "This node already checked in for the current period; the next check-in is automatic."
+      ;;
+    failed|skipped)
+      if [[ "$kind" == failed ]]; then rest=$(checkin_failure_reason "$rest"); else rest="${rest%.}"; fi
+      say "The first check-in failed: $rest."
+      say "The node keeps retrying on its own schedule. Run $(cmd_hint status) for details."
+      ;;
+    *)
+      say "No check-in result yet; run $(cmd_hint status) in a few minutes."
+      ;;
+  esac
+}
+
+# Watches the running service's journal for the first check-in's outcome, for
+# up to SALVORIAS_FIRST_CHECKIN_SECONDS. Reads only this service run's entries
+# (its InvocationID), so lines of an earlier install never count, and follows
+# a restart to the new run. Advisory only: whatever the outcome, the install
+# has succeeded and its exit code does not change. Ctrl-C ends the watch, not
+# the install; each journal read is a bounded snapshot, never a follow.
+FIRST_CHECKIN_SKIP=0
+watch_first_checkin() {
+  local secs="$SALVORIAS_FIRST_CHECKIN_SECONDS" deadline inv outcome=""
+  (( secs > 0 )) || return 0
+  say ""
+  say "Watching for the first check-in (up to ${secs}s; Ctrl-C skips the wait, the node keeps running)..."
+  FIRST_CHECKIN_SKIP=0
+  trap 'FIRST_CHECKIN_SKIP=1' INT
+  deadline=$(( $(date +%s) + secs ))
+  while (( FIRST_CHECKIN_SKIP == 0 )); do
+    inv=$(systemctl show -p InvocationID --value "$UNIT_NAME" 2>/dev/null || true)
+    if [[ "$inv" =~ ^[0-9a-f]{32}$ ]]; then
+      outcome=$(timeout 15 journalctl "_SYSTEMD_INVOCATION_ID=$inv" -o cat --no-pager 2>/dev/null | first_checkin_outcome) || true
+    fi
+    if [[ -n "$outcome" ]] || (( $(date +%s) >= deadline )); then break; fi
+    sleep 2 || true
+  done
+  trap on_signal INT
+  if (( FIRST_CHECKIN_SKIP == 1 )) && [[ -z "$outcome" ]]; then
+    say ""
+    say "Stopped watching. The node keeps running; check its first check-in with: $(cmd_hint status)"
+  else
+    print_first_checkin "$outcome"
+  fi
+  say "$ACTIVE_NOTE"
+}
+
 # ─── install ───────────────────────────────────────────────────────────────
 
 cmd_install() {
@@ -1525,7 +1728,7 @@ cmd_install() {
   fi
   # With every license already holding a node the install still goes ahead:
   # the app chooses which node the registration replaces, and asks the owner
-  # to confirm before it moves a node off Save Hosting (print_registration_box
+  # to confirm before it moves a node off Save Hosting (print_setup_boxes
   # says so).
   if [[ "$BOUND_STATE" == "owner" ]]; then
     say "Node $NODE_ADDRESS is already registered to this wallet; no new registration needed."
@@ -1554,23 +1757,26 @@ cmd_install() {
   write_state awaiting-registration
   install_self_copy
 
-  if [[ "$BOUND_STATE" != "owner" ]]; then
-    query_chain "$PATH_LINK" "$NODE_ADDRESS"
-    read_binding
-  fi
-  if [[ "$BOUND_STATE" == "owner" ]]; then
-    say ""
-    rule
-    say " FUND THE NODE"
-    rule
-    say "   Node address: $NODE_ADDRESS"
-    print_funding
-    rule
-  else
-    print_registration_box "$OPEN_SLOTS"
-    wait_for_binding "$OPT_WAIT_MINUTES"
-  fi
+  query_chain "$PATH_LINK" "$NODE_ADDRESS"
+  await_funded_and_registered
   finalize_install
+}
+
+# From a fresh slot-info --node result in SLOT_JSON: goes on at once when the
+# node is already registered and funded (a kept or imported key), otherwise
+# shows what is left to do and waits for it.
+await_funded_and_registered() {
+  read_readiness
+  if [[ "$NODE_REGISTERED" == yes && "$NODE_FUNDED" == yes ]]; then
+    say "Node $NODE_ADDRESS is registered and holds $(wei_to_savdr "$(json_str nodeBalanceWei)") SAVDR."
+    return 0
+  fi
+  if [[ "$NODE_REGISTERED" == yes ]]; then
+    print_funding_box
+  else
+    print_setup_boxes "$OPEN_SLOTS"
+  fi
+  wait_until_ready "$OPT_WAIT_MINUTES"
 }
 
 finalize_install() {
@@ -1599,6 +1805,7 @@ finalize_install() {
     die "The node service started but did not stay up (it stopped or was restarted within 10 seconds). The key and settings are saved, systemd keeps retrying the service, and the install is not marked finished. Fix the problem shown above, then run: $(cmd_hint resume)"
   fi
   write_state installed
+  watch_first_checkin
 
   # Fresh balance and fee for the summary.
   local balance="" cost=""
@@ -1626,7 +1833,7 @@ finalize_install() {
   warn_if_unfunded "$balance" "$cost"
   say ""
   say "Next:"
-  say "  sudo salvorias-selfhost status       service, binding, balance, recent logs"
+  say "  sudo salvorias-selfhost status       service, registration, funding, recent logs"
   say "  sudo salvorias-selfhost backup-key   copy the node key for offline storage (do this now)"
   say "  sudo salvorias-selfhost upgrade      install a newer node release"
   say "  sudo salvorias-selfhost uninstall    remove the node from this server"
@@ -1661,11 +1868,8 @@ cmd_resume() {
   check_rpc
   query_chain "$PATH_LINK" "$NODE_ADDRESS"
   read_binding
-  if [[ "$BOUND_STATE" != "owner" ]]; then
-    read_open_slots
-    print_registration_box "$OPEN_SLOTS"
-    wait_for_binding "$OPT_WAIT_MINUTES"
-  fi
+  if [[ "$BOUND_STATE" != "owner" ]]; then read_open_slots; fi
+  await_funded_and_registered
   finalize_install
 }
 
@@ -1685,17 +1889,25 @@ cmd_status() {
   if run_slot_info "$PATH_LINK" "$NODE_ADDRESS"; then
     read_binding
     case "$BOUND_STATE" in
-      owner) say "  Binding:   registered to the owner" ;;
-      replaced) say "  Binding:   NOT REGISTERED: another node has taken its place (app > Licenses > Self Setup, paste the node address to register it again)" ;;
-      other) say "  Binding:   REGISTERED TO A DIFFERENT WALLET ($BOUND_OTHER)" ;;
-      *) say "  Binding:   NOT REGISTERED (app > Licenses > Self Setup, paste the node address)" ;;
+      owner) say "  Registered: yes (to the owner)" ;;
+      replaced) say "  Registered: NO: another node has taken its place (app > Licenses > Self Setup, paste the node address to register it again)" ;;
+      other) say "  Registered: NO: registered to a DIFFERENT WALLET ($BOUND_OTHER)" ;;
+      *) say "  Registered: NO (app > Licenses > Self Setup, paste the node address)" ;;
     esac
     local balance cost
     balance=$(json_str nodeBalanceWei)
     cost=$(json_str estimatedCheckInCostWei)
-    if is_uint "$balance"; then
-      say "  Balance:   $(wei_to_savdr "$balance") SAVDR"
-      warn_if_unfunded "$balance" "$cost"
+    if ! is_uint "$balance"; then
+      say "  Funded:     unknown (the chain query returned no balance)"
+    elif has_balance "$balance"; then
+      say "  Funded:     yes ($(wei_to_savdr "$balance") SAVDR)"
+    else
+      say "  Funded:     NO (0 SAVDR; send 1 SAVDR to the node address)"
+    fi
+    if is_uint "$balance"; then warn_if_unfunded "$balance" "$cost"; fi
+    if [[ "$BOUND_STATE" == owner ]] && has_balance "$balance"; then
+      say ""
+      say "$ACTIVE_NOTE"
     fi
   else
     say "  Chain:     could not read the chain ($(json_str error))"
@@ -2234,6 +2446,9 @@ parse_args() {
   fi
   if ! is_uint "$SALVORIAS_UPGRADE_WATCH_SECONDS" || (( SALVORIAS_UPGRADE_WATCH_SECONDS < MIN_UPGRADE_WATCH_SECONDS )); then
     usage_error "SALVORIAS_UPGRADE_WATCH_SECONDS must be a whole number of seconds, at least $MIN_UPGRADE_WATCH_SECONDS (a shorter watch cannot tell a working upgrade from a crashing one)."
+  fi
+  if ! is_uint "$SALVORIAS_FIRST_CHECKIN_SECONDS" || (( SALVORIAS_FIRST_CHECKIN_SECONDS > 3600 )); then
+    usage_error "SALVORIAS_FIRST_CHECKIN_SECONDS must be a whole number of seconds, 0 to 3600 (0 skips the watch)."
   fi
 }
 

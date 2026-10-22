@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Unit tests for install.sh's pure helpers: wei formatting and comparison,
-# the funding text, URL and repo validation, checksums.txt parsing, the ELF
+# the funding text and box order, the first check-in parsing and watch, URL
+# and repo validation, checksums.txt parsing, the ELF
 # header check, the version-name pattern and an interrupt during the
 # upgrade's switch back. The functions (and the regex variables they use) are
 # extracted from install.sh by name, so main never runs and nothing on the
@@ -18,13 +19,15 @@ extract() {
 extract_var() { grep -m 1 "^$1=" install.sh; }
 
 src=""
-for var in URL_PORT_RE URL_PATH_RE LOCAL_HTTP_RE HTTPS_URL_RE REPO_RE VERSION_LINE_SED NODE_RUN_PATH; do
+for var in URL_PORT_RE URL_PATH_RE LOCAL_HTTP_RE HTTPS_URL_RE REPO_RE VERSION_LINE_SED NODE_RUN_PATH ACTIVE_NOTE; do
   body=$(extract_var "$var")
   [[ -n "$body" ]] || { echo "FAIL: could not extract $var from install.sh"; exit 1; }
   src+="$body"$'\n'
 done
 for fn in say lower strip_zeros wei_lt warn wei_to_savdr is_uint json_str json_raw json_list \
-    read_binding print_funding warn_if_unfunded is_local_http_url is_safe_url is_safe_repo checksum_for check_elf node_run; do
+    read_binding print_funding warn_if_unfunded is_local_http_url is_safe_url is_safe_repo checksum_for check_elf node_run \
+    rule has_balance print_node_address print_setup_boxes print_funding_box missing_steps \
+    first_checkin_outcome checkin_failure_reason print_first_checkin; do
   body=$(extract "$fn")
   [[ -n "$body" ]] || { echo "FAIL: could not extract $fn from install.sh"; exit 1; }
   src+="$body"$'\n'
@@ -302,6 +305,154 @@ sig_rc=0
 wait "$sig_pid" || sig_rc=$?
 check "interrupted undo exits 130" "$sig_rc" 130
 check "an interrupt inside the switch back still ends on the old version" "$(cat "$T/sig.out" 2>/dev/null)" "old-good"
+
+echo "## funding comes before registration, and both are waited for"
+check_true "1 wei is a balance" has_balance 1
+check_true "1 SAVDR is a balance" has_balance 1000000000000000000
+check_false "0 is no balance" has_balance 0
+check_false "000 is no balance" has_balance 000
+check_false "an unreadable balance is no balance" has_balance ""
+check_false "a malformed balance is no balance" has_balance 1e18
+# Read by print_setup_boxes and print_funding.
+# shellcheck disable=SC2034
+NET_APP_URL="https://app.dev.salvorias.com"
+# shellcheck disable=SC2034
+SLOT_JSON='{"nodeBalanceWei":"0","openSlots":[0]}'
+boxes=$(print_setup_boxes "0")
+printf '%s\n' "$boxes" | sed 's/^/    | /'
+line_of() { printf '%s\n' "$1" | grep -nF -- "$2" | head -n 1 | cut -d: -f1; }
+fund_at=$(line_of "$boxes" "STEP 1: FUND THE NODE")
+reg_at=$(line_of "$boxes" "STEP 2: REGISTER THIS NODE IN THE SALVORIAS APP")
+check_true "box 1 is funding, box 2 is registration" test -n "$fund_at" -a -n "$reg_at" -a "${fund_at:-0}" -lt "${reg_at:-0}"
+check_lacks "no box registers first" "$boxes" "STEP 1: REGISTER"
+check_true "the node address is shown in step 1" test "$(line_of "$boxes" "$NODE_ADDRESS")" -lt "${reg_at:-0}"
+check_true "the wallet line is in step 1" test "$(line_of "$boxes" "$FUND_WANT_4")" -lt "${reg_at:-0}"
+check_true "the app link is in step 2" test "$(line_of "$boxes" "Open https://app.dev.salvorias.com/licenses/self-host")" -gt "${reg_at:-0}"
+check_has "step 2 points back at the address" "$boxes" "paste the node address"$'\n'"   from step 1 and confirm with your passcode."
+check_lacks "a free license: no replace notice" "$boxes" "All your licenses already have a node"
+check_has "no free license: the replace notice" "$(print_setup_boxes "")" "All your licenses already have a node"
+check_has "registered, unfunded: a funding box" "$(print_funding_box)" " FUND THE NODE"
+check_lacks "registered, unfunded: no registration step" "$(print_funding_box)" "REGISTER"
+check_has "neither: both named" "$(missing_steps no no)" "not funded and not registered yet: send 1 SAVDR to $NODE_ADDRESS, and register it in the app"
+check_has "unfunded: funding named" "$(missing_steps yes no)" "registered but not funded yet: send 1 SAVDR to $NODE_ADDRESS."
+check_lacks "unfunded: registration not asked for" "$(missing_steps yes no)" "register it"
+check_has "unregistered: registration named" "$(missing_steps no yes)" "funded but not registered yet: register it in the app"
+check_lacks "unregistered: funding not asked for" "$(missing_steps no yes)" "send 1 SAVDR"
+check_has "never read: says the chain was not read" "$(missing_steps "" "")" "could not be read"
+
+echo "## the first check-in, read from the daemon's journal"
+H="0x$(printf 'ab%.0s' {1..32})"
+P='[2026-10-22T12:06:12.123Z] [INFO ] '
+E='[2026-10-22T12:06:13.456Z] [ERROR] '
+W='[2026-10-22T12:06:13.456Z] [WARN ] '
+outcome_of() { printf '%s\n' "$@" | first_checkin_outcome; }
+START=("${P}Startup Jitter:   0s" "${P}── Cycle #1 ──" "${P}  ── Node Operator Check-Ins ──")
+check "confirmed" "$(outcome_of "${START[@]}" "${P}  Status: 0 already qualified, 1 need check-in" \
+  "${P}  [1/1] checkIn(10295) from $NODE_ADDRESS..." "${P}    TX Hash: $H" "${P}    Confirmed block 4242 (gas: 51234)")" "confirmed $H"
+check "TX Hash alone is still pending" "$(outcome_of "${START[@]}" "${P}    TX Hash: $H")" ""
+check "'0 already qualified, 1 need check-in' is still pending" "$(outcome_of "${P}  Status: 0 already qualified, 1 need check-in")" ""
+check "already qualified" "$(outcome_of "${START[@]}" "${P}  Status: 1 already qualified, 0 need check-in" "${P}  All nodes checked in for this period.")" "done"
+check "all checked in" "$(outcome_of "${P}  All nodes checked in for this period.")" "done"
+check "checked in too recently" "$(outcome_of "${P}    $NODE_ADDRESS checked in too recently. OK.")" "done"
+check "failed before a hash" "$(outcome_of "${P}  [1/1] checkIn(1) from $NODE_ADDRESS..." "${E}    $NODE_ADDRESS check-in failed: boom (code=X)")" "failed boom (code=X)"
+check "failed after a hash (the tx reverted)" "$(outcome_of "${P}    TX Hash: $H" "${E}    $NODE_ADDRESS check-in failed: transaction execution reverted")" "failed transaction execution reverted"
+check "the fee-cap skip, without the log prefix" \
+  "$(outcome_of "${W}    Node $NODE_ADDRESS skipped this cycle: network gas price 60 gwei is above MAX_GAS_PRICE_GWEI 50 gwei. No tx sent.")" \
+  "skipped Node $NODE_ADDRESS skipped this cycle: network gas price 60 gwei is above MAX_GAS_PRICE_GWEI 50 gwei. No tx sent."
+check "a low-balance warning is not an outcome" "$(outcome_of "${W}    Node $NODE_ADDRESS low balance: has 0 SAVDR, needs 0.0001 SAVDR. Fund this address.")" ""
+check "a failed cycle is not parsed (not a stable phrase)" "$(outcome_of "${E}  Cycle failed: could not detect network")" ""
+check "Confirmed block without a TX Hash is not a check-in" "$(outcome_of "${P}    Confirmed block 1")" ""
+check "a short hash is not taken" "$(outcome_of "${P}    TX Hash: 0xabc" "${P}    Confirmed block 1")" ""
+check "lines without the log prefix still parse" "$(outcome_of "    TX Hash: $H" "    Confirmed block 7")" "confirmed $H"
+check "the first outcome wins" "$(outcome_of "${P}  All nodes checked in for this period." "${E}    x check-in failed: later")" "done"
+check "an empty journal is pending" "$(printf '' | first_checkin_outcome)" ""
+
+echo "## the failure reason"
+NOSAVDR="the node has no SAVDR yet; send 1 SAVDR to $NODE_ADDRESS"
+check "'not EOA' means no SAVDR" "$(checkin_failure_reason 'could not coalesce error (error={ "code": -32000, "message": "invalid transaction: the sender is not EOA" }, payload={ "id": 9 }, code=UNKNOWN_ERROR, version=6.16.0)')" "$NOSAVDR"
+check "'insufficient funds' means no SAVDR" "$(checkin_failure_reason 'insufficient funds for intrinsic transaction cost (transaction="0x02", info={ }, code=INSUFFICIENT_FUNDS, version=6.16.0)')" "$NOSAVDR"
+check "'Not EOA' in any case" "$(checkin_failure_reason 'sender Not EOA')" "$NOSAVDR"
+check "ethers' wrapper is cut to the node's message" "$(checkin_failure_reason 'could not coalesce error (error={ "code": -32000, "message": "mock-rpc: transactions are disabled in this test" }, payload={ "id": 9, "jsonrpc": "2.0", "method": "eth_sendRawTransaction", "params": [ "0x02f8" ] }, code=UNKNOWN_ERROR, version=6.16.0)')" "mock-rpc: transactions are disabled in this test"
+check "other errors lose ethers' detail list" "$(checkin_failure_reason 'execution reverted: "CheckInClosed()" (action="estimateGas", data="0x", reason=null)')" 'execution reverted: "CheckInClosed()"'
+check "control characters dropped" "$(checkin_failure_reason $'bad\033[31m thing\r')" "bad[31m thing"
+check "at most 200 characters" "$(checkin_failure_reason "$(printf 'x%.0s' {1..300})" | wc -c | tr -d ' ')" "200"
+check "a trailing period is dropped (the line adds its own)" "$(checkin_failure_reason 'timeout.')" "timeout"
+check "an empty reason" "$(checkin_failure_reason '')" "no reason given"
+
+echo "## the first check-in result line"
+# Read by print_first_checkin and the watch.
+# shellcheck disable=SC2034
+NET_EXPLORER_URL="https://testnet.savscanner.io"
+cmd_hint() { printf 'sudo salvorias-selfhost %s' "$1"; }
+check "confirmed, with the explorer link" "$(print_first_checkin "confirmed $H")" "First check-in confirmed (tx $H).
+  https://testnet.savscanner.io/tx/$H"
+check "already done" "$(print_first_checkin "done")" "This node already checked in for the current period; the next check-in is automatic."
+check "failed, no SAVDR" "$(print_first_checkin 'failed invalid transaction: the sender is not EOA')" "The first check-in failed: $NOSAVDR.
+The node keeps retrying on its own schedule. Run sudo salvorias-selfhost status for details."
+check "the fee-cap skip line as is" "$(print_first_checkin "skipped Node $NODE_ADDRESS skipped this cycle: network gas price 60 gwei is above MAX_GAS_PRICE_GWEI 50 gwei. No tx sent." | head -n 1)" \
+  "The first check-in failed: Node $NODE_ADDRESS skipped this cycle: network gas price 60 gwei is above MAX_GAS_PRICE_GWEI 50 gwei. No tx sent."
+check "no result in time" "$(print_first_checkin "")" "No check-in result yet; run sudo salvorias-selfhost status in a few minutes."
+check "the Active note" "$ACTIVE_NOTE" "It can take up to 30 minutes for your license to show Active in the Salvorias app after the first check-in. Check back then."
+
+echo "## the first check-in watch: bounded, Ctrl-C safe, never fails the install"
+# The real watch_first_checkin with systemctl, journalctl and timeout stood
+# in for; the journal is a file the test writes.
+watch_script() {
+  local secs="$1" journal="$2"
+  # The quoted lines are the child shell's own code.
+  # shellcheck disable=SC2016
+  { printf '%s\n' 'set -euo pipefail' "SALVORIAS_FIRST_CHECKIN_SECONDS=$secs" "JOURNAL=$journal" \
+      "NODE_ADDRESS=$NODE_ADDRESS" 'NET_EXPLORER_URL=https://testnet.savscanner.io' 'UNIT_NAME=u' \
+      'say() { printf "%s\n" "$*"; }' 'cmd_hint() { printf "sudo salvorias-selfhost %s" "$1"; }' \
+      'systemctl() { printf "0123456789abcdef0123456789abcdef\n"; }' \
+      'journalctl() { [[ "$1" == _SYSTEMD_INVOCATION_ID=0123456789abcdef0123456789abcdef ]] && cat "$JOURNAL"; }' \
+      'timeout() { shift; "$@"; }' 'on_signal() { echo ON_SIGNAL; exit 130; }' 'trap on_signal INT'
+    extract_var ACTIVE_NOTE
+    for f in first_checkin_outcome checkin_failure_reason print_first_checkin watch_first_checkin; do extract "$f"; done
+    printf '%s\n' 'watch_first_checkin' 'echo "AFTER rc=$?"' 'trap -p INT'
+  } >"$T/watch.sh"
+}
+printf '%s\n' "${P}── Cycle #1 ──" "${P}    TX Hash: $H" "${P}    Confirmed block 9 (gas: 1)" >"$T/journal-ok"
+watch_script 30 "$T/journal-ok"
+w_out=$(bash "$T/watch.sh" 2>&1)
+check_has "a result ends the watch" "$w_out" "First check-in confirmed (tx $H)."
+check_has "then the Active note" "$w_out" "$ACTIVE_NOTE"
+check_has "the install goes on" "$w_out" "AFTER rc=0"
+check_has "Ctrl-C goes back to the installer's handler afterwards" "$w_out" "on_signal"
+printf '%s\n' "${P}── Cycle #1 ──" "${E}    $NODE_ADDRESS check-in failed: insufficient funds for gas" >"$T/journal-fail"
+watch_script 30 "$T/journal-fail"
+w_out=$(bash "$T/watch.sh" 2>&1)
+check_has "a failed check-in is reported" "$w_out" "The first check-in failed: $NOSAVDR."
+check_has "a failed check-in does not fail the install" "$w_out" "AFTER rc=0"
+printf '%s\n' "${P}── Cycle #1 ──" >"$T/journal-pending"
+watch_script 3 "$T/journal-pending"
+w_start=$(date +%s)
+w_out=$(bash "$T/watch.sh" 2>&1)
+w_secs=$(( $(date +%s) - w_start ))
+check_has "no result: the timeout line" "$w_out" "No check-in result yet; run sudo salvorias-selfhost status in a few minutes."
+check_has "no result: the install goes on" "$w_out" "AFTER rc=0"
+check_true "the watch is bounded (3s asked, took ${w_secs}s)" test "$w_secs" -le 8
+watch_script 0 "$T/journal-ok"
+check "0 skips the watch" "$(bash "$T/watch.sh" 2>&1 | head -n 1)" "AFTER rc=0"
+# Ctrl-C: SIGINT to the whole process group, the way a terminal sends it. A
+# background job of a non-interactive shell starts with SIGINT ignored, which
+# a trap cannot undo, so python3 resets it and makes a new group first.
+watch_script 60 "$T/journal-pending"
+python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setpgid(0, 0); os.execvp(sys.argv[1], sys.argv[1:])' \
+  bash "$T/watch.sh" >"$T/watch-int.out" 2>&1 &
+w_pid=$!
+sleep 2
+w_start=$(date +%s)
+kill -INT -- "-$w_pid" 2>/dev/null || true
+w_rc=0
+wait "$w_pid" || w_rc=$?
+w_secs=$(( $(date +%s) - w_start ))
+w_out=$(cat "$T/watch-int.out")
+check "Ctrl-C during the watch: exit 0" "$w_rc" "0"
+check_has "Ctrl-C ends the watch, not the install" "$w_out" "AFTER rc=0"
+check_has "Ctrl-C says the node keeps running" "$w_out" "Stopped watching. The node keeps running"
+check_lacks "Ctrl-C during the watch does not run the installer's interrupt handler" "$w_out" "ON_SIGNAL"
+check_true "Ctrl-C ends the watch promptly (${w_secs}s)" test "$w_secs" -le 5
 
 echo "unit-math: $fails failed"
 [[ "$fails" -eq 0 ]]
