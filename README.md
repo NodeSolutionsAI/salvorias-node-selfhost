@@ -127,8 +127,8 @@ The default network is **mainnet**. To try it on testnet first, add
    boot. The node checks in right away (`STARTUP_JITTER=0` in `node.env`).
    - If the service cannot be started, the install is not marked finished:
      fix the problem it shows, then run `sudo salvorias-selfhost resume`.
-9. **Watches for the first check-in** for up to 2 minutes, then prints one
-   of:
+9. **Watches for the first check-in** for up to 2 minutes (each journal
+   read is cut off at the time left), then prints one of:
    - `First check-in confirmed (tx 0x…).`, with a link to the transaction on
      savscanner.io (testnet.savscanner.io on testnet);
    - `This node already checked in for the current period; the next check-in
@@ -136,7 +136,8 @@ The default network is **mainnet**. To try it on testnet first, add
    - `The first check-in failed: <reason>.` The node keeps retrying on its
      own schedule; `sudo salvorias-selfhost status` shows the details. A
      node with no SAVDR shows as "the node has no SAVDR yet; send 1 SAVDR to
-     <address>";
+     <address>", and one with too little for the fee as "the node's SAVDR
+     balance is too low for the fee; send more SAVDR to <address>";
    - `No check-in result yet; run sudo salvorias-selfhost status in a few
      minutes.`
 
@@ -351,7 +352,9 @@ Exit codes:
   the app, or both. Then run `sudo salvorias-selfhost resume`.
 - **"The first check-in failed"**: the node keeps running and retries on its
   own schedule. Run `sudo salvorias-selfhost status` for the log lines. "The
-  node has no SAVDR yet" means the funds have not reached the node address.
+  node has no SAVDR yet" means the funds have not reached the node address;
+  "the node's SAVDR balance is too low for the fee" means it holds some, but
+  not enough: send more.
 - **The license does not show Active yet**: it can take up to 30 minutes
   after the first check-in. Check back then.
 - **The service keeps restarting**: run `sudo salvorias-selfhost status` and

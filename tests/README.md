@@ -21,12 +21,16 @@ bash arithmetic reads as invalid octal), the funding text (send 1 SAVDR to the n
 box order (fund first, then register; the address and wallet line in step 1)
 and the missing-step messages, the first check-in parsing (confirmed, already
 qualified, failed, the fee-cap skip, and what stays pending), the failure
-reasons (a "not EOA" or "insufficient funds" refusal becomes "the node has no
-SAVDR yet", ethers' wrapper is cut down to the node's message), the result
-lines with the explorer link and the Active note, and the watch itself with
-stand-ins for systemctl and journalctl (it ends on a result, times out within
-its bound, never changes the exit code, and Ctrl-C ends the watch but not the
-install), the URL and repo rules, `checksums.txt` parsing (empty file, missing entry,
+reasons (a "not EOA" refusal becomes "the node has no SAVDR yet", an
+"insufficient funds" one "the node's SAVDR balance is too low for the fee",
+ethers' wrapper is cut down to the node's message), the wait's progress lines
+(the real wait loop on a fake clock: 25 failed reads with different error
+text print 2 lines, not 25), the result lines with the explorer link and the
+Active note, and the watch itself, with the real `timeout` and stand-in
+systemctl and journalctl executables (it ends on a result; with stand-ins
+that hang 30s it still ends within its 1-3s limit plus 2s; it never changes
+the exit code; Ctrl-C ends the watch but not the install, also while a
+journal read hangs), the URL and repo rules, `checksums.txt` parsing (empty file, missing entry,
 `*name` entries, CRLF, conflicting entries), the ELF header check, and the
 version-name pattern (no `..`, leading dot or dash, or slash), the
 `openSlots` reader (a missing or malformed list stops the install; only `[]`
@@ -127,9 +131,10 @@ messages, files, owners and modes.
     (same UID) and says so;
   - the app putting another node on that license (`<state-dir>/replaced-by`):
     `nodeToOwner` still names the owner but no license points at the node.
-    `status` says NOT REGISTERED, and a reinstall with the kept key does not
+    `status` says `Registered: NO`, and a reinstall with the kept key does not
     skip the registration: it waits, and finishes once the node is registered
-    again.
+    again. Its first check-in gets an "insufficient funds" refusal from the
+    mock, shown as `the node's SAVDR balance is too low for the fee`.
 - **No free slot** (a mock answering an empty `findOpenSlots` for two
   licenses): the install does not stop. It reaches the registration wait,
   the box carries the "All your licenses already have a node" notice and the

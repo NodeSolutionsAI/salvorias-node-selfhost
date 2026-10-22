@@ -1402,10 +1402,13 @@ missing_steps() {
 
 # Polls until the node is BOTH registered to the owner and funded: starting
 # the service earlier only produces failed check-ins. Prints a progress line
-# when the state changes, and otherwise once a minute. Ctrl-C or a timeout
-# leaves the install resumable: the key and state file are already written.
+# when the state changes, and otherwise once a minute. The state is the pair
+# of answers (or "unreadable"), never the line's text: an RPC error's wording
+# can differ on every poll and must not print a line each time. Ctrl-C or a
+# timeout leaves the install resumable: the key and state file are already
+# written.
 wait_until_ready() {
-  local minutes="$1" deadline now rc line last_line="" last_print=0
+  local minutes="$1" deadline now rc line state last_state="" last_print=0
   deadline=$(( $(date +%s) + minutes * 60 ))
   NODE_REGISTERED=""
   NODE_FUNDED=""
@@ -1425,21 +1428,23 @@ wait_until_ready() {
         say "Funded: the node holds $(wei_to_savdr "$(json_str nodeBalanceWei)") SAVDR."
         return 0
       fi
+      state="$NODE_REGISTERED/$NODE_FUNDED"
       line="registered: $NODE_REGISTERED   funded: $NODE_FUNDED"
       INTERRUPT_HINT="Your node key is saved. $(missing_steps "$NODE_REGISTERED" "$NODE_FUNDED") Then continue with:
   $(cmd_hint resume)"
     else
+      state="unreadable"
       line="could not read the chain ($(json_str error)); will retry"
     fi
-    if [[ "$line" != "$last_line" ]] || (( now - last_print >= 60 )); then
+    if [[ "$state" != "$last_state" ]] || (( now - last_print >= 60 )); then
       say "  $(date +%H:%M:%S)  $line"
-      if [[ "$line" != "$last_line" ]]; then
-        case "$line" in
-          "registered: yes   funded: no") say "            Registered. Now send 1 SAVDR to $NODE_ADDRESS; the install goes on once it arrives." ;;
-          "registered: no   funded: yes") say "            Funded. Now register the node in the app (step 2); the install goes on once the registration is on-chain." ;;
+      if [[ "$state" != "$last_state" ]]; then
+        case "$state" in
+          yes/no) say "            Registered. Now send 1 SAVDR to $NODE_ADDRESS; the install goes on once it arrives." ;;
+          no/yes) say "            Funded. Now register the node in the app (step 2); the install goes on once the registration is on-chain." ;;
         esac
       fi
-      last_line="$line"
+      last_state="$state"
       last_print=$now
     fi
     if (( now >= deadline )); then
@@ -1604,15 +1609,20 @@ first_checkin_outcome() {
 }
 
 # checkin_failure_reason RAW: a short reason from the daemon's error text.
-# An address that never held SAVDR is refused as "not EOA", and a short
-# balance as "insufficient funds": both mean the node needs SAVDR. Otherwise
-# ethers' wrapper ("could not coalesce error (error={ … "message": "…" },
+# An address that never held SAVDR is refused as "not EOA". "Insufficient
+# funds" means the node holds some SAVDR, but less than the fee needs (the
+# install only starts the service once the balance is above zero), so it gets
+# its own wording. Otherwise ethers' wrapper ("could not coalesce error (error={ … "message": "…" },
 # payload=…)") is cut down to the node's own message. Control characters are
 # dropped: the text comes from an RPC server.
 checkin_failure_reason() {
   local raw="$1" re='"message": ?"([^"]*)"'
-  if [[ "${raw,,}" == *"not eoa"* || "${raw,,}" == *insufficient* ]]; then
+  if [[ "${raw,,}" == *"not eoa"* ]]; then
     printf 'the node has no SAVDR yet; send 1 SAVDR to %s' "$NODE_ADDRESS"
+    return 0
+  fi
+  if [[ "${raw,,}" == *insufficient* ]]; then
+    printf "the node's SAVDR balance is too low for the fee; send more SAVDR to %s" "$NODE_ADDRESS"
     return 0
   fi
   if [[ "$raw" =~ $re ]]; then
@@ -1654,10 +1664,17 @@ print_first_checkin() {
 # (its InvocationID), so lines of an earlier install never count, and follows
 # a restart to the new run. Advisory only: whatever the outcome, the install
 # has succeeded and its exit code does not change. Ctrl-C ends the watch, not
-# the install; each journal read is a bounded snapshot, never a follow.
+# the install; each journal read is a snapshot, never a follow.
+# Bounded: systemctl, journalctl and the pause between reads each get at most
+# the time left (at least 1s, which is the most the watch can overrun). They
+# run under `timeout --foreground` so they stay in the terminal's process
+# group: a plain `timeout` moves them out of it, and a Ctrl-C would then wait
+# for the command to finish or time out. --foreground signals only the
+# command itself, not processes it starts, which fits here: both are single
+# processes, with their pagers turned off.
 FIRST_CHECKIN_SKIP=0
 watch_first_checkin() {
-  local secs="$SALVORIAS_FIRST_CHECKIN_SECONDS" deadline inv outcome=""
+  local secs="$SALVORIAS_FIRST_CHECKIN_SECONDS" deadline left inv outcome=""
   (( secs > 0 )) || return 0
   say ""
   say "Watching for the first check-in (up to ${secs}s; Ctrl-C skips the wait, the node keeps running)..."
@@ -1665,12 +1682,17 @@ watch_first_checkin() {
   trap 'FIRST_CHECKIN_SKIP=1' INT
   deadline=$(( $(date +%s) + secs ))
   while (( FIRST_CHECKIN_SKIP == 0 )); do
-    inv=$(systemctl show -p InvocationID --value "$UNIT_NAME" 2>/dev/null || true)
-    if [[ "$inv" =~ ^[0-9a-f]{32}$ ]]; then
-      outcome=$(timeout 15 journalctl "_SYSTEMD_INVOCATION_ID=$inv" -o cat --no-pager 2>/dev/null | first_checkin_outcome) || true
+    left=$(( deadline - $(date +%s) ))
+    (( left > 0 )) || break
+    inv=$(timeout --foreground "$left" systemctl show --no-pager -p InvocationID --value "$UNIT_NAME" 2>/dev/null) || inv=""
+    left=$(( deadline - $(date +%s) ))
+    if (( left > 0 )) && [[ "$inv" =~ ^[0-9a-f]{32}$ ]]; then
+      outcome=$(timeout --foreground "$left" journalctl "_SYSTEMD_INVOCATION_ID=$inv" -o cat --no-pager 2>/dev/null | first_checkin_outcome) || true
     fi
-    if [[ -n "$outcome" ]] || (( $(date +%s) >= deadline )); then break; fi
-    sleep 2 || true
+    [[ -z "$outcome" ]] || break
+    left=$(( deadline - $(date +%s) ))
+    (( left > 0 )) || break
+    sleep "$(( left < 2 ? left : 2 ))" || true
   done
   trap on_signal INT
   if (( FIRST_CHECKIN_SKIP == 1 )) && [[ -z "$outcome" ]]; then

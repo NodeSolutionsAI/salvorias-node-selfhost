@@ -340,6 +340,32 @@ check_has "unregistered: registration named" "$(missing_steps no yes)" "funded b
 check_lacks "unregistered: funding not asked for" "$(missing_steps no yes)" "send 1 SAVDR"
 check_has "never read: says the chain was not read" "$(missing_steps "" "")" "could not be read"
 
+echo "## the wait's progress lines follow the state, not the error text"
+# The real wait_until_ready with a fake clock (each `date +%s` moves it 3s
+# on) and a chain that fails 25 polls in a row, with different error text
+# each time, then answers "not registered, not funded" until the 2-minute
+# timeout. Expected: the error line at the start and once a minute later
+# (2 lines, not 25), then one line for the new state, then the stop.
+# The quoted lines are the child shell's own code.
+# shellcheck disable=SC2016
+{ printf '%s\n' 'set -euo pipefail' "CLOCK_FILE=$T/clock" "NODE_ADDRESS=$NODE_ADDRESS" "OWNER=$OWNER" \
+    'SALVORIAS_POLL_SECONDS=3 INTERRUPT_HINT="" POLLS=0 SLOT_JSON="" PATH_LINK=/nonexistent' 'printf "1000\n" >"$CLOCK_FILE"' \
+    'date() { if [[ "${1:-}" == +%s ]]; then local c; c=$(( $(<"$CLOCK_FILE") + 3 )); printf "%s\n" "$c" >"$CLOCK_FILE"; printf "%s\n" "$c"; else printf "00:00:00\n"; fi; }' \
+    'sleep() { :; }' 'say() { printf "%s\n" "$*"; }' 'cmd_hint() { printf "sudo salvorias-selfhost %s" "$1"; }' \
+    'stop() { printf "STOP: %s\n" "$*"; exit 3; }' 'die() { printf "DIE: %s\n" "$*"; exit 1; }' \
+    'run_slot_info() { POLLS=$((POLLS + 1)); if (( POLLS <= 25 )); then SLOT_JSON="{\"error\":\"request timed out after ${POLLS}017 ms\"}"; return 1; fi; SLOT_JSON="{\"boundOwner\":null,\"boundSlot\":null,\"nodeBalanceWei\":\"0\"}"; }'
+  for f in lower is_uint strip_zeros wei_to_savdr json_str json_raw has_balance read_binding read_readiness missing_steps wait_until_ready; do extract "$f"; done
+  printf '%s\n' 'wait_until_ready 2'
+} >"$T/wait.sh"
+wait_rc=0
+wait_out=$(bash "$T/wait.sh" 2>&1) || wait_rc=$?
+printf '%s\n' "$wait_out" | sed 's/^/    | /'
+check "the wait times out with exit 3" "$wait_rc" "3"
+check "25 failed reads with changing text: 2 lines (the first, and one a minute later)" \
+  "$(printf '%s\n' "$wait_out" | grep -c 'could not read the chain' || true)" "2"
+check "the new state prints once" "$(printf '%s\n' "$wait_out" | grep -c 'registered: no   funded: no$' || true)" "1"
+check_has "the stop names both missing steps" "$wait_out" "STOP: Waited 2 min. The node is not funded and not registered yet"
+
 echo "## the first check-in, read from the daemon's journal"
 H="0x$(printf 'ab%.0s' {1..32})"
 P='[2026-10-22T12:06:12.123Z] [INFO ] '
@@ -369,8 +395,11 @@ check "an empty journal is pending" "$(printf '' | first_checkin_outcome)" ""
 
 echo "## the failure reason"
 NOSAVDR="the node has no SAVDR yet; send 1 SAVDR to $NODE_ADDRESS"
+LOWSAVDR="the node's SAVDR balance is too low for the fee; send more SAVDR to $NODE_ADDRESS"
 check "'not EOA' means no SAVDR" "$(checkin_failure_reason 'could not coalesce error (error={ "code": -32000, "message": "invalid transaction: the sender is not EOA" }, payload={ "id": 9 }, code=UNKNOWN_ERROR, version=6.16.0)')" "$NOSAVDR"
-check "'insufficient funds' means no SAVDR" "$(checkin_failure_reason 'insufficient funds for intrinsic transaction cost (transaction="0x02", info={ }, code=INSUFFICIENT_FUNDS, version=6.16.0)')" "$NOSAVDR"
+check "'insufficient funds' means a balance too low for the fee" "$(checkin_failure_reason 'insufficient funds for intrinsic transaction cost (transaction="0x02", info={ }, code=INSUFFICIENT_FUNDS, version=6.16.0)')" "$LOWSAVDR"
+check_lacks "'insufficient funds' is not called 'no SAVDR'" "$(checkin_failure_reason 'insufficient funds for gas * price + value')" "no SAVDR"
+check "'Insufficient' in any case" "$(checkin_failure_reason 'INSUFFICIENT FUNDS')" "$LOWSAVDR"
 check "'Not EOA' in any case" "$(checkin_failure_reason 'sender Not EOA')" "$NOSAVDR"
 check "ethers' wrapper is cut to the node's message" "$(checkin_failure_reason 'could not coalesce error (error={ "code": -32000, "message": "mock-rpc: transactions are disabled in this test" }, payload={ "id": 9, "jsonrpc": "2.0", "method": "eth_sendRawTransaction", "params": [ "0x02f8" ] }, code=UNKNOWN_ERROR, version=6.16.0)')" "mock-rpc: transactions are disabled in this test"
 check "other errors lose ethers' detail list" "$(checkin_failure_reason 'execution reverted: "CheckInClosed()" (action="estimateGas", data="0x", reason=null)')" 'execution reverted: "CheckInClosed()"'
@@ -395,18 +424,28 @@ check "no result in time" "$(print_first_checkin "")" "No check-in result yet; r
 check "the Active note" "$ACTIVE_NOTE" "It can take up to 30 minutes for your license to show Active in the Salvorias app after the first check-in. Check back then."
 
 echo "## the first check-in watch: bounded, Ctrl-C safe, never fails the install"
-# The real watch_first_checkin with systemctl, journalctl and timeout stood
-# in for; the journal is a file the test writes.
+# The real watch_first_checkin, and the real timeout, with stand-in systemctl
+# and journalctl executables first on PATH. The journal is a file the test
+# writes; STUB_SYSTEMCTL_SLEEP and STUB_JOURNAL_SLEEP make a stand-in hang
+# that long before answering.
+mkdir -p "$T/wbin"
+# The quoted bodies are the stand-ins' own code.
+# shellcheck disable=SC2016
+# A hang is the stand-in itself sleeping (exec), as a hung systemctl or
+# journalctl would: one process, which `timeout --foreground` stops.
+printf '#!/bin/sh\n[ "${STUB_SYSTEMCTL_SLEEP:-0}" = 0 ] || exec sleep "$STUB_SYSTEMCTL_SLEEP"\necho 0123456789abcdef0123456789abcdef\n' >"$T/wbin/systemctl"
+# shellcheck disable=SC2016
+printf '#!/bin/sh\n[ "${STUB_JOURNAL_SLEEP:-0}" = 0 ] || exec sleep "$STUB_JOURNAL_SLEEP"\n[ "$1" = _SYSTEMD_INVOCATION_ID=0123456789abcdef0123456789abcdef ] && cat "$JOURNAL"\n' >"$T/wbin/journalctl"
+chmod 0755 "$T/wbin/systemctl" "$T/wbin/journalctl"
 watch_script() {
-  local secs="$1" journal="$2"
+  local secs="$1" journal="$2" systemctl_sleep="${3:-0}" journal_sleep="${4:-0}"
   # The quoted lines are the child shell's own code.
   # shellcheck disable=SC2016
-  { printf '%s\n' 'set -euo pipefail' "SALVORIAS_FIRST_CHECKIN_SECONDS=$secs" "JOURNAL=$journal" \
+  { printf '%s\n' 'set -euo pipefail' "export PATH=$T/wbin:\$PATH" "export STUB_SYSTEMCTL_SLEEP=$systemctl_sleep STUB_JOURNAL_SLEEP=$journal_sleep JOURNAL=$journal" \
+      "SALVORIAS_FIRST_CHECKIN_SECONDS=$secs" \
       "NODE_ADDRESS=$NODE_ADDRESS" 'NET_EXPLORER_URL=https://testnet.savscanner.io' 'UNIT_NAME=u' \
       'say() { printf "%s\n" "$*"; }' 'cmd_hint() { printf "sudo salvorias-selfhost %s" "$1"; }' \
-      'systemctl() { printf "0123456789abcdef0123456789abcdef\n"; }' \
-      'journalctl() { [[ "$1" == _SYSTEMD_INVOCATION_ID=0123456789abcdef0123456789abcdef ]] && cat "$JOURNAL"; }' \
-      'timeout() { shift; "$@"; }' 'on_signal() { echo ON_SIGNAL; exit 130; }' 'trap on_signal INT'
+      'on_signal() { echo ON_SIGNAL; exit 130; }' 'trap on_signal INT'
     extract_var ACTIVE_NOTE
     for f in first_checkin_outcome checkin_failure_reason print_first_checkin watch_first_checkin; do extract "$f"; done
     printf '%s\n' 'watch_first_checkin' 'echo "AFTER rc=$?"' 'trap -p INT'
@@ -422,7 +461,7 @@ check_has "Ctrl-C goes back to the installer's handler afterwards" "$w_out" "on_
 printf '%s\n' "${P}── Cycle #1 ──" "${E}    $NODE_ADDRESS check-in failed: insufficient funds for gas" >"$T/journal-fail"
 watch_script 30 "$T/journal-fail"
 w_out=$(bash "$T/watch.sh" 2>&1)
-check_has "a failed check-in is reported" "$w_out" "The first check-in failed: $NOSAVDR."
+check_has "a failed check-in is reported" "$w_out" "The first check-in failed: $LOWSAVDR."
 check_has "a failed check-in does not fail the install" "$w_out" "AFTER rc=0"
 printf '%s\n' "${P}── Cycle #1 ──" >"$T/journal-pending"
 watch_script 3 "$T/journal-pending"
@@ -432,6 +471,24 @@ w_secs=$(( $(date +%s) - w_start ))
 check_has "no result: the timeout line" "$w_out" "No check-in result yet; run sudo salvorias-selfhost status in a few minutes."
 check_has "no result: the install goes on" "$w_out" "AFTER rc=0"
 check_true "the watch is bounded (3s asked, took ${w_secs}s)" test "$w_secs" -le 8
+# systemctl and journalctl that hang far past the limit: each gets at most
+# the time left, so the watch still ends within the limit plus a second or two.
+for limit in 1 3; do
+  watch_script "$limit" "$T/journal-ok" 30 30
+  w_start=$(date +%s)
+  w_out=$(bash "$T/watch.sh" 2>&1)
+  w_secs=$(( $(date +%s) - w_start ))
+  check_true "hanging systemctl and journalctl: a ${limit}s watch ends within the limit (took ${w_secs}s)" test "$w_secs" -le $((limit + 2))
+  check_has "hanging systemctl and journalctl (${limit}s): the timeout line" "$w_out" "No check-in result yet"
+  check_has "hanging systemctl and journalctl (${limit}s): the install goes on" "$w_out" "AFTER rc=0"
+done
+# Only journalctl hangs: systemctl answers at once, the journal read is cut.
+watch_script 2 "$T/journal-ok" 0 30
+w_start=$(date +%s)
+w_out=$(bash "$T/watch.sh" 2>&1)
+w_secs=$(( $(date +%s) - w_start ))
+check_true "a hanging journalctl alone: a 2s watch ends within the limit (took ${w_secs}s)" test "$w_secs" -le 4
+check_has "a hanging journalctl alone: the timeout line" "$w_out" "No check-in result yet"
 watch_script 0 "$T/journal-ok"
 check "0 skips the watch" "$(bash "$T/watch.sh" 2>&1 | head -n 1)" "AFTER rc=0"
 # Ctrl-C: SIGINT to the whole process group, the way a terminal sends it. A
@@ -453,6 +510,21 @@ check_has "Ctrl-C ends the watch, not the install" "$w_out" "AFTER rc=0"
 check_has "Ctrl-C says the node keeps running" "$w_out" "Stopped watching. The node keeps running"
 check_lacks "Ctrl-C during the watch does not run the installer's interrupt handler" "$w_out" "ON_SIGNAL"
 check_true "Ctrl-C ends the watch promptly (${w_secs}s)" test "$w_secs" -le 5
+# Ctrl-C while journalctl hangs inside `timeout --foreground`: the stand-in
+# gets the signal too, so the watch ends at once, not when the read times out.
+watch_script 60 "$T/journal-pending" 0 50
+python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setpgid(0, 0); os.execvp(sys.argv[1], sys.argv[1:])' \
+  bash "$T/watch.sh" >"$T/watch-int2.out" 2>&1 &
+w_pid=$!
+sleep 2
+w_start=$(date +%s)
+kill -INT -- "-$w_pid" 2>/dev/null || true
+w_rc=0
+wait "$w_pid" || w_rc=$?
+w_secs=$(( $(date +%s) - w_start ))
+check "Ctrl-C during a hanging read: exit 0" "$w_rc" "0"
+check_has "Ctrl-C during a hanging read ends the watch, not the install" "$(cat "$T/watch-int2.out")" "AFTER rc=0"
+check_true "Ctrl-C during a hanging read ends the watch promptly (${w_secs}s)" test "$w_secs" -le 5
 
 echo "unit-math: $fails failed"
 [[ "$fails" -eq 0 ]]

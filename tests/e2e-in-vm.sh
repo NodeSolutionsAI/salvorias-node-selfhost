@@ -438,12 +438,18 @@ expect_log replaced-reinstall 'STOPPED: Waited 1 min\. The node is funded but no
 progress_lines=$(grep -cE '^  [0-9:]{8}  registered: ' "$OUT/replaced-reinstall.log" || true)
 expect_true "progress is printed on change or once a minute, not every poll ($progress_lines lines)" test "$progress_lines" -ge 1 -a "$progress_lines" -le 2
 rm -f "$FAITHFUL_STATE/replaced-by"
+# The mock refuses this run's first check-in the way the chain refuses a
+# balance too small for the fee.
+printf 'insufficient funds for gas * price + value: balance 100, tx cost 100000000000000\n' >"$FAITHFUL_STATE/send-error"
 run replaced-resume env SALVORIAS_POLL_SECONDS=3 "$SELF" resume --wait-minutes 1
+rm -f "$FAITHFUL_STATE/send-error"
 expect_rc 0 "registered again: resume completes"
 # Registered again before resume ran, so resume skips the box and the wait.
 expect_no_log replaced-resume 'REGISTER THIS NODE IN THE SALVORIAS APP' "resume sees the new registration (no registration box)"
 expect_no_log replaced-resume 'FUND THE NODE' "resume sees the node funded (no funding box)"
 expect_log replaced-resume 'is registered and holds 1 SAVDR' "resume goes straight on"
+expect_log replaced-resume "^The first check-in failed: the node's SAVDR balance is too low for the fee; send more SAVDR to $FNODE\\.\$" "an 'insufficient funds' refusal is explained as a balance too low for the fee"
+expect_no_log replaced-resume 'has no SAVDR yet' "an 'insufficient funds' refusal is not called 'no SAVDR'"
 expect_log replaced-resume '=== Salvorias node installed ===' "resume finishes the install"
 run faithful-purge with_tty "uninstall
 delete node key
