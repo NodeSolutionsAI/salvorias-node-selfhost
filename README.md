@@ -18,9 +18,13 @@ not run a server, use Save Hosting in the Salvorias app instead.
 ## What you need
 
 - A Linux server with **systemd**, and root access (`sudo`).
-  - Tested on Ubuntu 22.04 and newer, and Debian 12 and newer. Other systemd
-    distributions get a warning but usually work.
-  - CPU: x86_64 (amd64) or aarch64 (arm64).
+  - Tested end to end (the full `tests/e2e-lima.sh` suite, in a fresh VM with
+    real systemd) on Ubuntu 24.04, Ubuntu 22.04 and Debian 12, each on aarch64
+    (arm64). The suite has not been run on x86_64 (amd64) or on other
+    distributions or releases. Other systemd distributions get a warning but
+    usually work.
+  - CPU: x86_64 (amd64) or aarch64 (arm64). The installer picks the matching
+    release binary, but only the arm64 path has been run end to end.
   - About 200 MB of memory for the node. Outbound HTTPS (port 443). No
     inbound ports are needed.
 - The **public wallet address** that holds your Salvorias node license. It is
