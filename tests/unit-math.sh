@@ -523,6 +523,41 @@ check_lacks "no message prints an RPC response cut with \${body:0:N} instead" "$
 # shellcheck disable=SC2016
 check_lacks "no message prints the node binary's output cut with \${out:0:N} instead" "$install_text" '${out:0:'
 
+# Chain data other than error text: the chain id, the bound wallet and the NFT
+# contract all come from the RPC and are printed in messages.
+out=$(site_run query_chain <<EOF
+run_slot_info() { SLOT_JSON='{"chainId":'$(printf '%q' "$HOSTILE_JSON")'}'; return 0; }
+query_chain /bin/true
+EOF
+)
+check_has "query_chain: a wrong chain id is shown cleaned" "$out" "DIE: Chain query answered from chain 'boom[2J FAKE: install ok', expected 7283."
+check_false "query_chain: no control character in the wrong-chain message" has_ctrl "$out"
+out=$(site_run read_readiness read_binding lower is_uint has_balance <<EOF
+cmd_hint() { printf 'hint'; }
+NODE_ADDRESS=0xnode OWNER=0x1
+SLOT_JSON='{"boundOwner":"'$(printf '%q' "$HOSTILE_JSON")'","boundSlot":null}'
+read_readiness
+EOF
+)
+check_has "read_readiness: a wallet the node is bound to is shown cleaned" "$out" "registered to a different wallet (boom[2J FAKE: install ok), not 0x1"
+check_has "read_readiness: and in the instruction that follows" "$out" "(signed in with boom[2J FAKE: install ok)"
+check_false "read_readiness: no control character in the message" has_ctrl "$out"
+# shellcheck disable=SC2034
+SLOT_JSON='{"boundOwner":"'"$HOSTILE_JSON"'"}'
+BOUND_OTHER=""; read_binding
+check_false "read_binding: BOUND_OTHER (printed by install, status and resume) has no control character" has_ctrl "$BOUND_OTHER"
+check "read_binding: BOUND_OTHER holds the cleaned text" "$BOUND_OTHER" "boom[2J FAKE: install ok"
+# The NFT contract is printed by a check inside cmd_install, which cannot run
+# here, so the source is checked instead.
+# shellcheck disable=SC2016
+check_has "the NFT contract in the mismatch message goes through clean_text" "$install_text" 'NFT contract $(clean_text "$nft"), but'
+# shellcheck disable=SC2016
+check_lacks "and is not printed raw" "$install_text" 'NFT contract $nft'
+# shellcheck disable=SC2016
+check_lacks "the chain id is not printed raw" "$install_text" "chain '\$chain'"
+# shellcheck disable=SC2016
+check "BOUND_OTHER is only ever assigned cleaned" "$(grep -c 'BOUND_OTHER=' install.sh)" "$(grep -c 'BOUND_OTHER=$(clean_text\|^BOUND_OTHER=""' install.sh)"
+
 echo "## the fixed paths and the salvorias account are taken only with proof of ownership"
 # The quoted snippets handed to own_try are the child shell's own code.
 # shellcheck disable=SC2016
@@ -556,7 +591,7 @@ else
         "SERVICE_USER=$acct" 'ACCOUNT_CREATED="" ACCOUNT_UID="" OPT_SELF="" RUNNING_FILE="" OPT_BINARY=""'
       extract_var STATE_FILE_HEADER
       extract_var SELF_MARKER
-      for f in say warn state_file_is_ours account_marker_matches installer_proof refuse_unowned_paths refuse_foreign_account \
+      for f in say warn state_file_is_ours account_marker_matches write_account_marker installer_proof refuse_unowned_paths refuse_foreign_account \
           require_owned_account ensure_user path_link_is_ours self_file_is_ours switch_current prune_versions stray_files remove_strays; do
         extract "$f"
       done
@@ -624,6 +659,7 @@ rc=0"
   out=$(own_try "$r" <<<'require_owned_account; echo passed')
   check_has "an existing account with no marker is refused" "$out" "DIE: An account named 'nobody' (UID $OWN_UID) already exists, but this installer did not create it"
   check_has "the refusal says how to resolve it" "$out" "sudo userdel nobody"
+  check_has "and how to recover from a run killed just after it made the account" "$out" "killed in the instant after it created the account"
   check_lacks "the install does not go on" "$out" "passed"
   out=$(own_try "$r" <<<'ensure_user; echo "created=$ACCOUNT_CREATED"')
   check_has "ensure_user refuses it too" "$out" "DIE: An account named 'nobody'"
@@ -636,6 +672,33 @@ rc=0"
   r=$(own_new acct-marker-other); own_marker "$r" "$((OWN_UID + 1))"
   out=$(own_try "$r" <<<'require_owned_account; echo passed')
   check_has "an account made again under the same name (another UID) is refused" "$out" "DIE: An account named 'nobody'"
+  # A new account: the marker is written by ensure_user itself, before
+  # make_dirs or any other step has made a directory, so a run stopped right
+  # after the account exists is still recognised by the next install.
+  NEW_ACCT=e2eunitnew
+  if id -u "$NEW_ACCT" >/dev/null 2>&1; then userdel "$NEW_ACCT"; fi
+  r=$(own_new acct-new)
+  out=$(own_try "$r" "$NEW_ACCT" <<<'ensure_user
+echo "created=$ACCOUNT_CREATED"
+if account_marker_matches; then echo marker-ok; else echo marker-missing; fi
+for d in "$ETC_DIR" "$OPT_DIR" "$BIN_ROOT"; do if [[ -e "$d" ]]; then echo "dir-made:$d"; fi; done
+echo "data=$(stat -c "%a %U:%G" "$DATA_DIR")"')
+  new_uid=$(id -u "$NEW_ACCT" 2>/dev/null || echo none)
+  check_has "ensure_user creates the account" "$out" "Created system user: $NEW_ACCT"
+  check_has "the marker is in place when ensure_user returns" "$out" "marker-ok"
+  check "it names the new account's UID" "$(cat "$r/var/salvorias/installer-account.txt" 2>/dev/null)" "UID=$new_uid"
+  check_lacks "and no other directory exists yet (make_dirs has not run)" "$out" "dir-made:"
+  check_has "the data directory is root:account 750 from the start" "$out" "data=750 root:$NEW_ACCT"
+  # The next install: the account exists, nothing else does, and it is not refused.
+  out=$(own_try "$r" "$NEW_ACCT" <<<'refuse_unowned_paths; require_owned_account; ensure_user; echo "resumed=$ACCOUNT_CREATED"')
+  check_has "after an interruption right there, the next install reuses the account" "$out" "resumed=yes"
+  check_lacks "and is not refused" "$out" "DIE:"
+  userdel "$NEW_ACCT" 2>/dev/null || true
+  # An interrupt handler set by the caller survives ensure_user.
+  r=$(own_new acct-new-trap)
+  out=$(own_try "$r" "$NEW_ACCT" <<<'on_signal() { :; }; trap on_signal INT; ensure_user >/dev/null; trap -p INT')
+  check_has "the caller's INT handler is back after ensure_user" "$out" "trap -- 'on_signal' SIGINT"
+  userdel "$NEW_ACCT" 2>/dev/null || true
   r=$(own_new acct-none)
   out=$(own_try "$r" no-such-account-r12 <<<'require_owned_account; echo passed')
   check "no account yet: nothing to refuse" "$out" "passed

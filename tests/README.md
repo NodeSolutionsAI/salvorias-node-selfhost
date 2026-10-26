@@ -40,14 +40,18 @@ binary runs with (a stand-in binary prints what it received). Three more groups:
 - `clean_text`, which every RPC error, chain error, binary output and journal
   line goes through before it is printed: control characters dropped, line
   breaks folded, the length capped. The sites are run for real with hostile
-  text (`check_rpc`, `query_chain`, `show_journal`, the check-in outcome).
+  text (`check_rpc`, `query_chain` for its error, its wrong-chain-id message,
+  `read_readiness` and `read_binding` for the bound wallet, `show_journal`, the
+  check-in outcome); the NFT-contract message is checked in the source.
 - Ownership (run as root, so skipped on other users): `refuse_unowned_paths`
   with each of the five fixed paths present and no proof (refused, named,
   untouched), and with the state file or the account marker as proof (marker
   that is a link, has a second hard link, names another UID, or sits in a
   data directory the account owns: no proof). A `salvorias` account without
   its marker is refused by `require_owned_account` and `ensure_user`; with it,
-  reused. `switch_current` and `install_self_copy` leave a foreign file or
+  reused. `ensure_user` on a new account writes the marker itself, before any
+  other directory exists, and puts the caller's INT handler back; the next
+  install reuses the account. `switch_current` and `install_self_copy` leave a foreign file or
   link in `/usr/local` alone; `prune_versions` and `remove_strays` do not
   delete directories they cannot show are the installer's.
 - The real `on_signal` and `undo_upgrade` with a slowed `switch_current`,
@@ -172,6 +176,11 @@ messages, files, owners and modes.
   `NODE_KEYS_FILE`, `SALVORIAS_NODE_VERSION`). Two control runs of the bare
   binary show those settings change its output; the installer's results do
   not change.
+- **An install killed right after it created the account** (section 4d): a
+  stand-in `install` records whether the account marker exists, then sends
+  SIGKILL to the installer as `make_dirs` starts. The marker must already name
+  the new account's UID, `/opt/salvorias` and `/etc/salvorias` must not exist
+  yet, and the next install must reuse the account (not refuse it) and go on.
 - **A licensed owner, simulated through `tests/mock-rpc.py`**
   (explained in the next section):
   - a piped install from a local release, run from a directory holding a

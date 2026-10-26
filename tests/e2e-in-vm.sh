@@ -566,6 +566,56 @@ delete node key
 expect_rc 0 "purge after the no-free-slot install"
 expect_true "server clean after the no-free-slot install" nothing_installed
 
+section "4d. an install killed right after it created the account leaves proof, and the next install resumes"
+# A stand-in `install` kills the installer (SIGKILL, which no handler can
+# catch) the moment make_dirs makes its first directory, which is the first
+# step after the account exists. It first records whether the account marker
+# was already there, and which directories were not.
+mkdir -p "$WORK/shim"
+cat >"$WORK/shim/install" <<'SHIM'
+#!/bin/bash
+if [[ " $* " == *" /opt/salvorias "* ]]; then
+  {
+    if [[ -f /var/lib/salvorias/installer-account.txt ]]; then echo "marker=yes"; else echo "marker=no"; fi
+    if [[ -e /opt/salvorias ]]; then echo "opt=yes"; else echo "opt=no"; fi
+    if [[ -e /etc/salvorias ]]; then echo "etc=yes"; else echo "etc=no"; fi
+    echo "account-uid=$(id -u salvorias)"
+    echo "marker-says=$(head -n 1 /var/lib/salvorias/installer-account.txt)"
+  } >"$SHIM_OUT"
+  kill -9 "$PPID"
+  exit 1
+fi
+exec /usr/bin/install "$@"
+SHIM
+chmod 0755 "$WORK/shim/install"
+expect_true "server clean before the kill test" nothing_installed
+run kill-after-account env PATH="$WORK/shim:$PATH" SHIM_OUT="$WORK/shim/out" bash "$INSTALL" --network testnet --rpc-url "$FULL_RPC" --binary "$BIN" --owner "$OWNER" --wait-minutes 1
+expect_rc 137 "the installer was killed (SIGKILL) as make_dirs began"
+# The stand-in inherited the installer's lock; give it a moment to exit.
+for _ in 1 2 3 4 5 6 7 8 9 10; do flock -n /run/salvorias-selfhost.lock true && break; sleep 1; done
+expect_log kill-after-account 'Created system user: salvorias' "the account was created before the kill"
+expect_true "the account marker existed before make_dirs made a directory" grep -qx 'marker=yes' "$WORK/shim/out"
+expect_true "/opt/salvorias and /etc/salvorias did not exist yet" bash -c "grep -qx 'opt=no' $WORK/shim/out && grep -qx 'etc=no' $WORK/shim/out"
+shim_marker_matches() {
+  local uid says
+  uid=$(sed -n 's/^account-uid=//p' "$WORK/shim/out")
+  says=$(sed -n 's/^marker-says=//p' "$WORK/shim/out")
+  [[ -n "$uid" && "$says" == "UID=$uid" ]]
+}
+expect_true "the marker named the new account's UID" shim_marker_matches
+expect_true "the killed run left the account and no state file" bash -c "id -u salvorias >/dev/null && [[ ! -e /etc/salvorias/selfhost.conf ]]"
+run resume-after-kill env SALVORIAS_POLL_SECONDS=10 bash "$INSTALL" --network testnet --rpc-url "$FULL_RPC" --binary "$BIN" --owner "$OWNER" --wait-minutes 1
+expect_rc 3 "the next install is not refused: it goes on to the registration wait (which times out)"
+expect_log resume-after-kill 'Using the system user salvorias that this installer created for an earlier install' "it reuses the account the killed run made"
+expect_no_log resume-after-kill 'did not create it|already exists, and nothing shows' "neither the account nor the data directory is refused"
+expect_true "state is awaiting-registration" grep -q '^STAGE=awaiting-registration$' /etc/salvorias/selfhost.conf
+run resume-after-kill-purge with_tty "uninstall
+delete node key
+" "$SELF uninstall --purge-key"
+expect_rc 0 "purge after the killed-and-resumed install"
+rm -rf "$WORK/shim"
+expect_true "server clean after the kill test" nothing_installed
+
 # ─── 5. Licensed owner via the mock RPC ───────────────────────────────────
 
 section "5. piped install from the release, with a file named main in the cwd; registration wait times out"

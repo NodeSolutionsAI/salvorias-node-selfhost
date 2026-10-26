@@ -786,7 +786,7 @@ query_chain() {
   esac
   local chain
   chain=$(json_raw chainId)
-  [[ "$chain" == "$NET_CHAIN_ID" ]] || die "Chain query answered from chain '$chain', expected $NET_CHAIN_ID."
+  [[ "$chain" == "$NET_CHAIN_ID" ]] || die "Chain query answered from chain '$(clean_text "$chain")', expected $NET_CHAIN_ID."
 }
 
 # ─── Owner address input ───────────────────────────────────────────────────
@@ -1022,11 +1022,29 @@ check_existing_user() {
 # its group, so a login or shared account would get at the key. ACCOUNT_CREATED
 # is therefore always yes after an install; the state file still records it,
 # and installs from before this rule may say no, which a purge honours.
+#
+# A new account gets its marker as the very next step, before make_dirs or
+# anything else, so a run stopped at any later point leaves proof that the
+# account is ours and the next install resumes. The marker lives in DATA_DIR,
+# which needs the new group, so DATA_DIR is made here (the same call make_dirs
+# would make) just before it. Interrupt signals are held across useradd and the
+# marker, then acted on once it exists. What is left is a kill the process
+# cannot catch (SIGKILL, power loss) in that few-millisecond span; the
+# refusal message tells that user how to recover.
 ensure_user() {
   if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
-    local nologin
+    local nologin saved held=""
     nologin=$(command -v nologin || printf '/usr/sbin/nologin')
+    saved=$(trap -p INT TERM HUP)
+    trap 'held=1' INT TERM HUP
     useradd --system --user-group --no-create-home --home-dir /nonexistent --shell "$nologin" "$SERVICE_USER"
+    if [[ ! -e "$DATA_DIR" && ! -L "$DATA_DIR" ]]; then
+      install -d -m 0750 -o root -g "$SERVICE_USER" "$DATA_DIR"
+    fi
+    write_account_marker
+    trap - INT TERM HUP
+    eval "$saved"
+    if [[ -n "$held" ]]; then kill -s INT "$$"; fi
     ACCOUNT_CREATED=yes
     ACCOUNT_UID=$(id -u "$SERVICE_USER")
     say "Created system user: $SERVICE_USER"
@@ -1041,7 +1059,7 @@ ensure_user() {
 
 # Stops an install on a `salvorias` account the installer cannot show it made.
 refuse_foreign_account() {
-  die "An account named '$SERVICE_USER' (UID $(id -u "$SERVICE_USER" 2>/dev/null || printf '?')) already exists, but this installer did not create it: $ACCOUNT_MARKER, which the installer leaves for an account it made, is missing or names another UID. Refusing to run the node service, and to share the node key, with an account it does not own. If nothing else uses the account, remove it ('sudo userdel $SERVICE_USER'), or rename it ('sudo usermod -l NEWNAME $SERVICE_USER' and 'sudo groupmod -n NEWNAME $SERVICE_USER'), then rerun. Nothing was changed."
+  die "An account named '$SERVICE_USER' (UID $(id -u "$SERVICE_USER" 2>/dev/null || printf '?')) already exists, but this installer did not create it: $ACCOUNT_MARKER, which the installer leaves for an account it made, is missing or names another UID. Refusing to run the node service, and to share the node key, with an account it does not own. If nothing else uses the account, remove it ('sudo userdel $SERVICE_USER'), or rename it ('sudo usermod -l NEWNAME $SERVICE_USER' and 'sudo groupmod -n NEWNAME $SERVICE_USER'), then rerun. Nothing was changed. If an earlier run of this installer was killed in the instant after it created the account, the account is its own but unproven: the same 'sudo userdel $SERVICE_USER' (it removes the group too), then rerun, recovers it."
 }
 
 # Read-only form of the same rule, for the start of an install.
@@ -1370,7 +1388,8 @@ read_binding() {
     fi
   else
     BOUND_STATE="other"
-    BOUND_OTHER="$bound"
+    # Printed in several messages, so cleaned once, here.
+    BOUND_OTHER=$(clean_text "$bound")
   fi
 }
 
@@ -1831,7 +1850,7 @@ cmd_install() {
   local nft licenses
   nft=$(json_str nftContract)
   if [[ "$(lower "$nft")" != "$(lower "$NET_NFT")" ]]; then
-    die "NodeCheckIn on $NETWORK counts licenses on NFT contract $nft, but this installer expects $NET_NFT. Refusing to continue: the installer may be out of date."
+    die "NodeCheckIn on $NETWORK counts licenses on NFT contract $(clean_text "$nft"), but this installer expects $NET_NFT. Refusing to continue: the installer may be out of date."
   fi
   licenses=$(json_raw licenseBalance)
   read_open_slots
@@ -1875,9 +1894,9 @@ cmd_install() {
   refuse_unowned_paths
   ensure_user
   make_dirs
-  # At once, not at the end of the install: a run stopped before the state
-  # file exists still leaves proof that the account and the directories are
-  # the installer's, so the next install can pick up where it stopped.
+  # ensure_user wrote the marker for a new account before any of this. This
+  # call covers a DATA_DIR that existed but was not root-owned then (an older
+  # layout), which make_dirs has just fixed; it rewrites the same marker.
   if [[ "$ACCOUNT_CREATED" == yes ]]; then write_account_marker; fi
   place_binary
   switch_current "$PLACED_NAME"
