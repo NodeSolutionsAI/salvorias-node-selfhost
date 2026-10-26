@@ -36,9 +36,22 @@ version-name pattern (no `..`, leading dot or dash, or slash), the
 `openSlots` reader (a missing or malformed list stops the install; only `[]`
 means no free license), the registration rule (the owner named AND a
 license entry found, `boundSlot`), and the scrubbed environment the node
-binary runs with (a stand-in binary prints what it received). One more test
-runs the real `on_signal` and `undo_upgrade` with a slowed `switch_current`
-and interrupts the switch back: the run must still end on the old version.
+binary runs with (a stand-in binary prints what it received). Three more groups:
+- `clean_text`, which every RPC error, chain error, binary output and journal
+  line goes through before it is printed: control characters dropped, line
+  breaks folded, the length capped. The sites are run for real with hostile
+  text (`check_rpc`, `query_chain`, `show_journal`, the check-in outcome).
+- Ownership (run as root, so skipped on other users): `refuse_unowned_paths`
+  with each of the five fixed paths present and no proof (refused, named,
+  untouched), and with the state file or the account marker as proof (marker
+  that is a link, has a second hard link, names another UID, or sits in a
+  data directory the account owns: no proof). A `salvorias` account without
+  its marker is refused by `require_owned_account` and `ensure_user`; with it,
+  reused. `switch_current` and `install_self_copy` leave a foreign file or
+  link in `/usr/local` alone; `prune_versions` and `remove_strays` do not
+  delete directories they cannot show are the installer's.
+- The real `on_signal` and `undo_upgrade` with a slowed `switch_current`,
+  interrupting the switch back: the run must still end on the old version.
 
 ## End-to-end, in a disposable VM
 
@@ -80,7 +93,13 @@ For an x86_64 VM, use `--target=bun-linux-x64` with the file name
 ```bash
 tests/e2e-lima.sh /path/to/e2e-bin            # creates, tests, deletes the VM
 tests/e2e-lima.sh --keep-vm /path/to/e2e-bin  # keep the VM for debugging
+tests/e2e-lima.sh --reuse-vm /path/to/e2e-bin # run in an existing selfhost-test VM
 ```
+
+If a VM named `selfhost-test` already exists, the script stops without
+touching it: it might be someone's work, and the suite changes system state in
+it. `--reuse-vm` runs in it anyway. The script deletes only a VM it created
+itself, never one it reused. `VM=name` picks another VM name.
 
 The transcript goes to `e2e-transcript.txt`. It ends with
 `RESULT: N passed, 0 failed`, and the script exits non-zero on any failure.
@@ -107,11 +126,18 @@ messages, files, owners and modes.
     not as a bash arithmetic error;
   - a shell script, and an ELF for another CPU, are refused as `--binary`
     before they run;
+  - each of `/etc/salvorias`, `/var/lib/salvorias`, `/opt/salvorias`,
+    `/usr/local/bin/salvorias-node` and `/usr/local/sbin/salvorias-selfhost`,
+    made beforehand with no state file or marker, is refused by `install`
+    with the path named, and is byte-for-byte unchanged afterwards;
+    `uninstall` and `uninstall --purge-key` refuse to delete such a directory,
+    and leave a foreign `/usr/local` link and file alone;
   - an existing `salvorias` login account is refused, and so are system
     accounts that share access: one with a supplementary group, one whose
     primary GID is not a system GID, and one whose group is another
-    account's primary group. A clean system account passes. Nothing is
-    written;
+    account's primary group. A clean system account that the installer did
+    not create is refused too (no marker names its UID), with the account
+    named and how to remove or rename it. Nothing is written;
   - the **no-license stop**, after which nothing is installed;
   - a **piped run** (`cat install.sh | bash -s --`) that reads its prompts
     from `/dev/tty`: a typed private key and a seed phrase are both rejected,
@@ -125,10 +151,12 @@ messages, files, owners and modes.
     (read-only) succeeds;
   - a full install through a mock that is faithful to that contract: the
     pre-check passes, and the registration is found by the slot scan (the
-    slot is checked in slot-info's JSON; the installer never prints it). It runs
-    with a clean `salvorias` system account made beforehand: the state file
-    records it as not the installer's, and `uninstall --purge-key` keeps it
-    (same UID) and says so;
+    slot is checked in slot-info's JSON; the installer never prints it). The
+    installer creates the `salvorias` account and writes its marker at install
+    time. The kept-key reinstall after a plain uninstall reuses that account.
+    Before the purge the test rewrites the state file to say the installer did
+    not create the account (an install from before that record existed), and
+    `uninstall --purge-key` keeps it (same UID) and says so;
   - the app putting another node on that license (`<state-dir>/replaced-by`):
     `nodeToOwner` still names the owner but no license points at the node.
     `status` says `Registered: NO`, and a reinstall with the kept key does not
@@ -217,6 +245,8 @@ messages, files, owners and modes.
     directory. It leaves a root-only marker naming the account the installer
     created (by UID), so the reinstall below still records the account as
     the installer's;
+  - the account is made again by hand under the same name with another UID:
+    the kept-key reinstall refuses it, and the key stays with the old UID;
   - planted links stop a reinstall, with the decoys untouched;
   - a reinstall that reuses the kept key while the node is registered but
     unfunded: only the funding box, `registered: yes   funded: no` until the
@@ -241,8 +271,11 @@ messages, files, owners and modes.
     already checked in for the current period; the next check-in is
     automatic.`;
   - a final purge with leftovers of an interrupted run planted (temp copies
-    of `salvorias-selfhost` and the unit file, a staging directory), which
-    removes them and leaves a clean server.
+    of `salvorias-selfhost` and the unit file, a staging directory), and with
+    the account replaced by a hand-made one (another UID), which it keeps. It
+    removes the leftovers and leaves a clean server, apart from that account;
+    a fresh install then refuses the replacement account, since the purge
+    removed the marker.
 - **Leak checks:**
   - the installer itself never tried to send a transaction, and no send
     reached the chain (every attempt was refused, or taken without

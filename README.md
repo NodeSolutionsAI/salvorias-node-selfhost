@@ -58,6 +58,12 @@ not run a server, use Save Hosting in the Salvorias app instead.
   directory belongs to root, and every file root touches there must be a
   regular file.
 - It refuses to set up a second node on a server that already has one.
+- It takes over nothing it cannot show it made. If `/etc/salvorias`,
+  `/var/lib/salvorias`, `/opt/salvorias`, `/usr/local/bin/salvorias-node` or
+  `/usr/local/sbin/salvorias-selfhost` already exists and was not created by
+  this installer, the install stops and names the path. The same goes for an
+  existing `salvorias` account. Uninstall deletes only what the installer
+  created.
 
 ## Install
 
@@ -252,6 +258,7 @@ is fine; a different key is refused.
 | `/var/lib/salvorias/` | root:salvorias, 0750 | Node data. The service can read it, not change it |
 | `/var/lib/salvorias/node-key.txt` | salvorias, 0600 | **The node's private key** |
 | `/var/lib/salvorias/node-address.txt` | root, 0644 | The node's public address |
+| `/var/lib/salvorias/installer-account.txt` | root, 0600 | Marks the `salvorias` account (by UID) as one this installer created. It stays after an uninstall that keeps the key, so a reinstall can reuse the account |
 | `/etc/systemd/system/salvorias-node.service` | root, 0644 | The service |
 
 The service runs as the unprivileged `salvorias` user and is sandboxed:
@@ -262,13 +269,29 @@ The service runs as the unprivileged `salvorias` user and is sandboxed:
 
 It logs to journald as `salvorias-node`.
 
-If a `salvorias` account already exists, the installer uses it only if it
-looks like the system account it would create itself: a system UID, its own
-`salvorias` group with no other members, a `nologin` or `false` shell, and no
-real home directory. Otherwise it stops and says why. An account the
-installer did not create is never deleted: `uninstall --purge-key` keeps it
-and says so. This includes installs made before the installer recorded who
-created the account.
+### The `salvorias` account and the fixed paths
+
+The installer creates the `salvorias` account itself and reuses it only when
+it can show it made that account: the `installer-account.txt` file above names
+the account's UID. This is what lets a reinstall after an `uninstall` that
+kept the key go on, and it is why `uninstall --purge-key` deletes the account
+only when the recorded UID still matches.
+
+A `salvorias` account the installer did not create is refused, even if it
+looks like a clean system account: the node key is shared with the account's
+group, so the installer will not hand it to an account it does not own. The
+message names the account. If nothing else uses it, remove it
+(`sudo userdel salvorias`) or rename it (`sudo usermod -l NEWNAME salvorias`
+and `sudo groupmod -n NEWNAME salvorias`), then run the installer again.
+
+The same rule covers the five fixed paths in the table above. If one of them
+already exists, and neither the installer's state file nor the account marker
+shows the installer made it, the install stops before it changes anything and
+names the path. Copy anything you need from it, move it aside (`sudo mv <path>
+<path>.old`) or remove it, then run the installer again. `uninstall` never
+deletes `/etc/salvorias`, `/opt/salvorias` or (with `--purge-key`)
+`/var/lib/salvorias` unless the same proof is there, and it never removes a
+`/usr/local` entry that is not the installer's own link or file.
 
 ## Configuration
 
@@ -344,6 +367,11 @@ Exit codes:
 
 ## Troubleshooting
 
+- **"... already exists, and nothing shows that this installer created it"**
+  or **"An account named 'salvorias' ... did not create it"**: something on
+  this server already uses one of the installer's fixed names. The installer
+  stops without changing it. See [The `salvorias` account and the fixed
+  paths](#the-salvorias-account-and-the-fixed-paths) for what to do.
 - **"holds no Salvorias node license"**: you entered a wallet other than
   the one holding the license. Use the address shown in the app.
 - **"All your licenses already have a node"**: not an error. Register the

@@ -106,7 +106,21 @@ expect_stat() {
 }
 nothing_installed() {
   [[ ! -e /etc/salvorias && ! -e /opt/salvorias && ! -e "$DATA" && ! -e "$SELF" \
-    && ! -e /etc/systemd/system/salvorias-node.service ]] && ! id -u salvorias >/dev/null 2>&1
+    && ! -e /etc/systemd/system/salvorias-node.service && ! -L /usr/local/bin/salvorias-node ]] \
+    && ! id -u salvorias >/dev/null 2>&1
+}
+# Whatever this installer did not create but has a fixed name here, as the
+# server's own: a directory with a file in it, a link, or a foreign tool.
+plant_foreign() {
+  case "$1" in
+    /usr/local/bin/salvorias-node) ln -s /root/decoy-profile "$1" ;;
+    /usr/local/sbin/salvorias-selfhost) printf '#!/bin/sh\necho not the installer\n' >"$1"; chmod 0755 "$1" ;;
+    *) mkdir -p "$1"; printf 'precious\n' >"$1/precious.txt" ;;
+  esac
+}
+# Owner, mode, size, target and hash of a path and everything under it.
+tree_state() {
+  { find "$1" -printf '%p %y %m %u:%g %s -> %l\n'; find "$1" -type f -exec sha256sum {} +; } 2>&1
 }
 service_user_ok() {
   [[ "$(getent passwd salvorias | cut -d: -f6,7)" == "/nonexistent:/usr/sbin/nologin" && "$(id -u salvorias)" -lt 1000 ]]
@@ -313,6 +327,52 @@ run elf-arch bash "$INSTALL" --network testnet --binary /root/wrongarch-node --o
 expect_rc 1 "an ELF for another CPU is refused before it runs"
 expect_log elf-arch 'built for another CPU' "wrong-CPU message"
 
+section "1b. a fixed path nothing proves the installer made is refused, and left untouched"
+# No state file and no account marker: /etc/salvorias and the others could be
+# anyone's. The refusal comes before any download, and changes nothing.
+for p in /etc/salvorias /var/lib/salvorias /opt/salvorias /usr/local/bin/salvorias-node /usr/local/sbin/salvorias-selfhost; do
+  plant_foreign "$p"
+  before="$(tree_state "$p")"
+  n="foreign-${p//\//_}"
+  run "$n" bash "$INSTALL" --network testnet --binary "$BIN" --owner "$OWNER"
+  expect_rc 1 "install refuses a pre-existing $p"
+  expect_log "$n" "$p already exists, and nothing shows that this installer created it" "the message names $p"
+  expect_log "$n" 'move it aside' "the message says how to go on ($p)"
+  expect_no_log "$n" 'Downloading|Checksum verified|Setting up this server' "nothing was downloaded or set up ($p)"
+  expect_true "$p is untouched (owner, mode, size, target, hash)" test "$(tree_state "$p")" = "$before"
+  rm -rf "$p"
+  expect_true "no account and no other path was created ($p)" nothing_installed
+done
+# Uninstall deletes only what it is shown to have made.
+plant_foreign /etc/salvorias
+plant_foreign /opt/salvorias
+before="$(tree_state /etc/salvorias; tree_state /opt/salvorias)"
+run foreign-uninstall bash "$INSTALL" uninstall --yes
+expect_rc 1 "uninstall refuses to delete a directory nothing proves is the installer's"
+expect_log foreign-uninstall 'Refusing to delete it' "the refusal is explained"
+expect_log foreign-uninstall '/etc/salvorias /opt/salvorias exists, and nothing shows' "it names both directories"
+expect_true "both directories untouched" test "$(tree_state /etc/salvorias; tree_state /opt/salvorias)" = "$before"
+rm -rf /etc/salvorias /opt/salvorias
+plant_foreign /var/lib/salvorias
+before="$(tree_state /var/lib/salvorias)"
+run foreign-purge with_tty "uninstall
+delete node key
+" "bash $INSTALL uninstall --purge-key"
+expect_rc 1 "uninstall --purge-key refuses to delete a data directory nothing proves is the installer's"
+expect_log foreign-purge 'Refusing to delete it' "the purge refusal is explained"
+expect_true "the data directory is untouched" test "$(tree_state /var/lib/salvorias)" = "$before"
+rm -rf /var/lib/salvorias
+# A link and a file in /usr/local that are not the installer's are left alone.
+plant_foreign /usr/local/bin/salvorias-node
+plant_foreign /usr/local/sbin/salvorias-selfhost
+before="$(tree_state /usr/local/bin/salvorias-node; tree_state /usr/local/sbin/salvorias-selfhost)"
+run foreign-usrlocal-uninstall bash "$INSTALL" uninstall --yes
+expect_rc 0 "uninstall with only foreign /usr/local entries has nothing to do"
+expect_log foreign-usrlocal-uninstall 'Nothing to uninstall' "and says so"
+expect_true "the foreign link and file are untouched" test "$(tree_state /usr/local/bin/salvorias-node; tree_state /usr/local/sbin/salvorias-selfhost)" = "$before"
+rm -f /usr/local/bin/salvorias-node /usr/local/sbin/salvorias-selfhost
+expect_true "server clean after section 1b" nothing_installed
+
 useradd --create-home --shell /bin/bash salvorias
 run login-user bash "$INSTALL" --network testnet --binary "$BIN" --owner "$OWNER"
 expect_rc 1 "an existing login account named salvorias is refused"
@@ -333,8 +393,12 @@ expect_rc 1 "a second account with the salvorias primary group is refused"
 expect_log user-shared-gid 'other accounts have the .salvorias. group as their primary group \(salvorias-other\)' "names the other account"
 userdel salvorias-other
 run user-clean bash "$INSTALL" --network testnet --binary "$BIN" --owner "$OWNER"
-expect_rc 3 "a clean system salvorias account passes the account check (then the no-license stop)"
-expect_no_log user-clean 'not a locked-down system account' "no account problem reported"
+expect_rc 1 "a clean system salvorias account the installer did not create is refused"
+expect_log user-clean "An account named 'salvorias' \\(UID [0-9]+\\) already exists, but this installer did not create it" "the refusal names the account and says it is not the installer's"
+expect_log user-clean 'sudo userdel salvorias' "the refusal says how to resolve it"
+expect_no_log user-clean 'not a locked-down system account' "it is refused for its origin, not for its shape (it is a clean system account)"
+expect_true "nothing written for the foreign account" test ! -e /etc/salvorias -a ! -e "$DATA" -a ! -e /opt/salvorias -a ! -e "$SELF"
+expect_true "the foreign account itself is untouched" bash -c "id -u salvorias >/dev/null"
 userdel salvorias
 groupadd -g 1500 salvorias
 useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin -g salvorias salvorias
@@ -387,18 +451,16 @@ section "4b. the testnet contract as deployed (no nodeToSlot getter)"
 run slot-info-testnet "$BIN" slot-info --rpc-url "$TESTNET_RPC" --contract "$TESTNET_CHECKIN" --owner "$OWNER" --node "$PROBE_NODE"
 expect_rc 0 "slot-info --node works against https://testnet.salvorias.net (read-only)"
 expect_log slot-info-testnet '"boundSlotSource":null' "reports boundSlotSource for an unbound node"
-# This install also runs with a salvorias account made beforehand, outside
-# the installer. check_existing_user accepts it; the purge below must keep it.
-useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin salvorias
-PRE_UID="$(id -u salvorias)"
 # Funded from the start (the mock answers balance-wei once the node is bound),
 # so the registration is the last step.
 printf '1000000000000000000\n' >"$FAITHFUL_STATE/balance-wei"
 bind_when_ready "$FAITHFUL_STATE" 4 &
 run faithful env SALVORIAS_POLL_SECONDS=3 bash "$INSTALL" --network testnet --rpc-url "$FAITHFUL_RPC" --binary "$BIN" --owner "$OWNER" --wait-minutes 3
 expect_rc 0 "a full install against the testnet contract shape completes"
-expect_log faithful 'Using the existing system user salvorias. This installer did not create it' "the pre-made account is used, and named as not the installer's"
-expect_true "state records the account as not created by the installer" grep -qx 'ACCOUNT_CREATED=no' /etc/salvorias/selfhost.conf
+expect_log faithful 'Created system user: salvorias' "the installer creates the account"
+expect_true "state records the account as created by the installer" grep -qx 'ACCOUNT_CREATED=yes' /etc/salvorias/selfhost.conf
+expect_stat "$DATA/installer-account.txt" "600 root:root"
+expect_true "the marker naming the account by UID is written at install time, not only by an uninstall" test "$(cat "$DATA/installer-account.txt")" = "UID=$(id -u salvorias)"
 expect_no_log faithful 'Could not read node registration data' "the slot-info --node pre-check passes"
 expect_log faithful 'Registered: node .* is bound to ' "registration found through the slot scan"
 expect_no_log faithful '\(slot [0-9]' "the registration line names no slot number"
@@ -426,6 +488,7 @@ expect_rc 0 "uninstall (keeps the key) after the node was replaced"
 run replaced-reinstall env SALVORIAS_POLL_SECONDS=5 bash "$INSTALL" --network testnet --rpc-url "$FAITHFUL_RPC" --binary "$BIN" --owner "$OWNER" --wait-minutes 1
 expect_rc 3 "a kept key whose license moved on is not taken as registered: the wait times out"
 expect_log replaced-reinstall 'Found the node key kept by an earlier uninstall' "the kept key is reused"
+expect_log replaced-reinstall 'Using the system user salvorias that this installer created for an earlier install' "the kept-key reinstall reuses the installer's own account (no refusal)"
 expect_log replaced-reinstall 'was registered to this wallet before, but another node has since taken its place' "says the node was replaced"
 expect_no_log replaced-reinstall 'already registered to this wallet' "no 'already registered' skip for a replaced node"
 expect_log replaced-reinstall 'REGISTER THIS NODE IN THE SALVORIAS APP' "registration box printed for the replaced node"
@@ -451,14 +514,18 @@ expect_log replaced-resume 'is registered and holds 1 SAVDR' "resume goes straig
 expect_log replaced-resume "^The first check-in failed: the node's SAVDR balance is too low for the fee; send more SAVDR to $FNODE\\.\$" "an 'insufficient funds' refusal is explained as a balance too low for the fee"
 expect_no_log replaced-resume 'has no SAVDR yet' "an 'insufficient funds' refusal is not called 'no SAVDR'"
 expect_log replaced-resume '=== Salvorias node installed ===' "resume finishes the install"
+# Plays an install made before the installer recorded who created the account
+# (or an adopted one): the state file does not say the installer created it.
+PRE_UID="$(id -u salvorias)"
+sed -i 's/^ACCOUNT_CREATED=.*/ACCOUNT_CREATED=no/; s/^ACCOUNT_UID=.*/ACCOUNT_UID=/' /etc/salvorias/selfhost.conf
 run faithful-purge with_tty "uninstall
 delete node key
 " "$SELF uninstall --purge-key"
 expect_rc 0 "purge after the faithful-contract install"
-expect_log faithful-purge 'It keeps the salvorias system user: this installer did not create it' "purge says up front that it keeps the account"
+expect_log faithful-purge 'It keeps the salvorias system user: this installer did not create it' "purge says up front that it keeps an account the state does not record as the installer's"
 expect_log faithful-purge 'Kept the salvorias user: this installer did not create it' "purge reports the account kept"
-expect_no_log faithful-purge 'Deleted the salvorias user' "purge does not delete the pre-made account"
-expect_true "the pre-made account still exists, same UID" test "$(id -u salvorias 2>/dev/null)" = "$PRE_UID"
+expect_no_log faithful-purge 'Deleted the salvorias user' "purge does not delete an account the state does not record as the installer's"
+expect_true "that account still exists, same UID" test "$(id -u salvorias 2>/dev/null)" = "$PRE_UID"
 expect_true "everything else removed" test ! -e /etc/salvorias -a ! -e /opt/salvorias -a ! -e "$DATA" -a ! -e "$SELF"
 userdel salvorias
 rm -f "$FAITHFUL_STATE/bound-node" "$FAITHFUL_STATE/balance-wei"
@@ -942,6 +1009,24 @@ expect_stat "$DATA/node-key.txt" "600 salvorias:salvorias"
 expect_true "service is gone from systemd" bash -c '! systemctl cat salvorias-node.service >/dev/null 2>&1'
 expect_stat "$DATA/installer-account.txt" "600 root:root"
 expect_true "the kept account is marked as the installer's, by UID" test "$(cat "$DATA/installer-account.txt")" = "UID=$(id -u salvorias)"
+# An account of that name made again by hand has another UID: the marker
+# names the old one, so the kept key is not handed to it.
+old_uid=$(id -u salvorias); old_gid=$(id -g salvorias)
+userdel salvorias
+# useradd would hand the UID just freed to the new account; ask for another.
+other_uid=$((old_uid - 1))
+while getent passwd "$other_uid" >/dev/null || getent group "$other_uid" >/dev/null; do other_uid=$((other_uid - 1)); done
+useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin -u "$other_uid" salvorias
+expect_true "the hand-made account has another UID" test "$(id -u salvorias)" != "$old_uid"
+run reinstall-other-account bash "$INSTALL" --network testnet --rpc-url "$MOCK_RPC" --binary "$BIN" --owner "$OWNER"
+expect_rc 1 "a kept-key reinstall refuses an account with another UID than the marker's"
+expect_log reinstall-other-account "An account named 'salvorias' \\(UID [0-9]+\\) already exists, but this installer did not create it" "it names the account and says it is not the installer's"
+expect_true "nothing installed, and the kept key still belongs to the old UID" \
+  bash -c "test ! -e /etc/salvorias -a ! -e /opt/salvorias && test \"\$(stat -c %u $DATA/node-key.txt)\" = $old_uid"
+userdel salvorias
+groupadd -r -g "$old_gid" salvorias
+useradd --system -g salvorias -u "$old_uid" --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin salvorias
+expect_true "the installer's account is back, same UID" test "$(id -u salvorias)" = "$old_uid"
 for spec in node-key.txt:/root/decoy-profile node-address.txt:/root/decoy-disk; do
   name="${spec%%:*}"; target="${spec#*:}"
   plant "$name" "$target"
@@ -1097,6 +1182,12 @@ expect_log purge-final 'Removed 3 file\(s\) left by an interrupted run' "leftove
 expect_log purge-final 'Kept the salvorias user: it is not the account this installer created' "a replacement account with another UID is kept"
 expect_no_log purge-final 'Deleted the salvorias user' "the replacement account is not deleted"
 expect_true "replacement account still exists" test "$(id -u salvorias 2>/dev/null)" == "$new_uid"
+# The purge removed the data directory and its marker, so nothing shows the
+# installer made this account: a new install refuses it.
+run replaced-account-install bash "$INSTALL" --network testnet --rpc-url "$MOCK_RPC" --binary "$BIN" --owner "$OWNER"
+expect_rc 1 "a fresh install refuses the hand-made replacement account"
+expect_log replaced-account-install "An account named 'salvorias' \\(UID $new_uid\\) already exists, but this installer did not create it" "it names the account and its UID"
+expect_true "nothing was written for it" test ! -e /etc/salvorias -a ! -e "$DATA" -a ! -e /opt/salvorias
 userdel salvorias
 expect_true "leftover temp files removed" \
   test ! -e /usr/local/sbin/.salvorias-selfhost.e2eXYZ -a ! -e /etc/systemd/system/.salvorias-node.service.e2eXYZ

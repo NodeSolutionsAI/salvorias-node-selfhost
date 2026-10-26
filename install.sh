@@ -14,6 +14,13 @@
 #   - It never prints the node's private key.
 #   - It never sends a transaction. Every chain call is a read.
 #   - One node per server. A second install is refused.
+#   - It takes over nothing it cannot show it made. The fixed paths (/etc,
+#     /var/lib and /opt/salvorias, /usr/local/bin/salvorias-node and
+#     /usr/local/sbin/salvorias-selfhost) and the salvorias account are used
+#     only with proof: the installer's state file, or the marker it leaves for
+#     the account it created. Uninstall deletes only what that proof covers.
+#   - Text that comes from outside (RPC errors, chain data, the node's
+#     journal) goes through clean_text before it is printed.
 #   - Root never follows a link it does not own. The data directory is
 #     root:salvorias 0750, so the service account cannot add or swap entries
 #     there, and every file root touches in it must be a regular, unlinked
@@ -65,9 +72,13 @@ SELF_MARKER="# salvorias-selfhost-installer"
 # can never interleave. In /run itself (root:root 0755), not the world-writable
 # /run/lock, so no other account can create, replace or link this path first.
 LOCK_FILE="/run/salvorias-selfhost.lock"
-# Written into DATA_DIR by an uninstall that keeps the key, so a later install
-# still knows that this installer created the service account.
+# Written into DATA_DIR as soon as an install has created the service account,
+# and again by an uninstall that keeps the key, so a later install still knows
+# that this installer created the account (and the directories beside it).
 ACCOUNT_MARKER="$DATA_DIR/installer-account.txt"
+# First line of the state file. With the marker above it is how the installer
+# tells its own files from ones that merely have the same fixed name.
+STATE_FILE_HEADER="# Written by the Salvorias self-host installer. The node daemon does not read"
 
 # Self-host wallets are not fee-exempt, so the daemon must pay the live
 # network fee. The cap stops it from paying through a fee spike.
@@ -91,6 +102,27 @@ usage_error() { printf 'ERROR: %s\n' "$*" >&2; printf 'Run with --help for usage
 stop() { printf '\nSTOPPED: %s\n' "$*" >&2; exit "$EXIT_STOPPED"; }
 banner() { printf '\n=== %s ===\n' "$*"; }
 rule() { printf '%s\n' "========================================================================"; }
+
+# clean_text [-n MAX] TEXT: TEXT that came from outside this script (an RPC
+# server, chain data, the node's journal, a download tool) made safe to put in
+# a message. Control characters (escape sequences, carriage returns that could
+# overwrite the line) are dropped, line breaks and tabs become a space, runs
+# of spaces collapse, and at most MAX characters (default 200) are kept. The
+# result is one line, printed without a trailing newline.
+clean_text() {
+  local max=200 s
+  if [[ $# -ge 2 && "$1" == -n && "$2" =~ ^[0-9]+$ ]]; then max="$2"; shift 2; fi
+  s="$*"
+  # Bounds the work below on an oversized response.
+  s="${s:0:4096}"
+  s="${s//[[:space:]]/ }"
+  s="${s//[^[:print:]]/}"
+  while [[ "$s" == *"  "* ]]; do s="${s//  / }"; done
+  s="${s# }"
+  s="${s:0:max}"
+  s="${s% }"
+  printf '%s' "$s"
+}
 
 usage() {
   cat <<EOF
@@ -484,12 +516,12 @@ check_rpc() {
     --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' "$RPC_URL" 2>&1) || rc=$?
   if (( rc == 22 )); then
     # Reached the server, which answered with an HTTP error: not a firewall issue.
-    die "The Salvorias RPC at $RPC_URL answered with an error ($body). It may be down for maintenance; try again later."
+    die "The Salvorias RPC at $RPC_URL answered with an error ($(clean_text "$body")). It may be down for maintenance; try again later."
   elif (( rc != 0 )); then
-    die "Cannot reach the Salvorias RPC at $RPC_URL ($body). Check that this server allows outbound HTTPS (port 443)."
+    die "Cannot reach the Salvorias RPC at $RPC_URL ($(clean_text "$body")). Check that this server allows outbound HTTPS (port 443)."
   fi
   hex=$(printf '%s' "$body" | sed -n 's/.*"result" *: *"\(0x[0-9a-fA-F]\{1,15\}\)".*/\1/p')
-  [[ -n "$hex" ]] || die "The RPC at $RPC_URL did not return a chain id. Response: ${body:0:200}"
+  [[ -n "$hex" ]] || die "The RPC at $RPC_URL did not return a chain id. Response: $(clean_text "$body")"
   if (( hex != NET_CHAIN_ID )); then
     die "The RPC at $RPC_URL is chain $((hex)), but $NETWORK is chain $NET_CHAIN_ID. Use the right --network or --rpc-url."
   fi
@@ -570,10 +602,10 @@ stage_binary() {
   local out rc=0
   out=$(node_run 60 "$STAGED_BIN" version </dev/null 2>&1) || rc=$?
   if (( rc != 0 )); then
-    die "The node binary does not run on this server (exit $rc: ${out:0:200}). Check it matches this CPU ($ASSET_ARCH). If ${TMPDIR:-/tmp} is mounted noexec, rerun with TMPDIR set to a directory that allows execution."
+    die "The node binary does not run on this server (exit $rc: $(clean_text "$out")). Check it matches this CPU ($ASSET_ARCH). If ${TMPDIR:-/tmp} is mounted noexec, rerun with TMPDIR set to a directory that allows execution."
   fi
   STAGED_VERSION=$(printf '%s\n' "$out" | sed -n "$VERSION_LINE_SED" | head -n 1)
-  [[ -n "$STAGED_VERSION" ]] || die "Unexpected output from 'salvorias-node version': ${out:0:200}"
+  [[ -n "$STAGED_VERSION" ]] || die "Unexpected output from 'salvorias-node version': $(clean_text "$out")"
   say "Node binary version: $STAGED_VERSION"
 }
 
@@ -608,6 +640,9 @@ place_binary() {
 
 # Atomically points /opt/salvorias/bin/current at a version directory.
 switch_current() {
+  if [[ -e "$PATH_LINK" || -L "$PATH_LINK" ]] && ! path_link_is_ours; then
+    die "$PATH_LINK is not the link this installer makes (to $CURRENT_LINK/salvorias-node). Refusing to replace it. Move it aside ('sudo mv $PATH_LINK $PATH_LINK.old'), then rerun."
+  fi
   ln -sfn "$1" "$BIN_ROOT/.current.new"
   mv -Tf "$BIN_ROOT/.current.new" "$CURRENT_LINK"
   ln -sfn "$CURRENT_LINK/salvorias-node" "$PATH_LINK"
@@ -657,7 +692,7 @@ install_self_copy() {
     if ( download_verified "install.sh" "$TMP_DIR/install.sh" ) >/dev/null 2>"$TMP_DIR/self.err"; then
       src="$TMP_DIR/install.sh"
     else
-      warn "Could not fetch a verified install.sh for $SELF_PATH ($(tr '\n' ' ' <"$TMP_DIR/self.err" | cut -c1-200)). Later commands: download install.sh and run it with sudo bash."
+      warn "Could not fetch a verified install.sh for $SELF_PATH ($(clean_text "$(head -c 4096 "$TMP_DIR/self.err")")). Later commands: download install.sh and run it with sudo bash."
       return 0
     fi
   else
@@ -666,6 +701,10 @@ install_self_copy() {
 
   if [[ "$(sed -n 2p "$src")" != "$SELF_MARKER" ]] || ! bash -n "$src" 2>/dev/null; then
     warn "$src does not look like this installer; not installing it as $SELF_PATH."
+    return 0
+  fi
+  if [[ -e "$SELF_PATH" || -L "$SELF_PATH" ]] && ! self_file_is_ours; then
+    warn "$SELF_PATH exists and is not a copy of this installer; leaving it alone. Later commands: use the installer you downloaded (sudo bash install.sh <command>)."
     return 0
   fi
   if [[ -f "$SELF_PATH" ]] && cmp -s "$src" "$SELF_PATH"; then
@@ -742,8 +781,8 @@ query_chain() {
   run_slot_info "$1" "${2:-}" || rc=$?
   case "$rc" in
     0) ;;
-    2) usage_error "The chain query rejected the input: $(json_str error)" ;;
-    *) die "Could not read the chain at $RPC_URL: $(json_str error). Try again in a few minutes." ;;
+    2) usage_error "The chain query rejected the input: $(clean_text "$(json_str error)")" ;;
+    *) die "Could not read the chain at $RPC_URL: $(clean_text "$(json_str error)"). Try again in a few minutes." ;;
   esac
   local chain
   chain=$(json_raw chainId)
@@ -845,7 +884,7 @@ write_state() {
   assert_plain_values "$1" "$NETWORK" "$RPC_URL" "$NET_CHAIN_ID" "$NET_CHECKIN" "$NET_NFT" "$NET_TREASURY" "$OWNER" "$NODE_ADDRESS"
   tmp=$(mktemp "$ETC_DIR/.selfhost.conf.XXXXXX")
   cat >"$tmp" <<EOF
-# Written by the Salvorias self-host installer. The node daemon does not read
+$STATE_FILE_HEADER
 # this file; it reads node.env. Do not edit.
 INSTALLER_VERSION=$INSTALLER_VERSION
 STAGE=$1
@@ -977,10 +1016,12 @@ check_existing_user() {
   fi
 }
 
-# Records in ACCOUNT_CREATED whether this installer created the account, so
-# that a purge never deletes an account someone else made. An existing
-# account counts as the installer's only when an earlier uninstall left the
-# marker for it (see account_marker_matches).
+# Creates the service account, or reuses one that this installer made for an
+# earlier install (account_marker_matches). An account of that name that the
+# installer did not make is refused, not adopted: the node key is handed to
+# its group, so a login or shared account would get at the key. ACCOUNT_CREATED
+# is therefore always yes after an install; the state file still records it,
+# and installs from before this rule may say no, which a purge honours.
 ensure_user() {
   if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
     local nologin
@@ -994,10 +1035,19 @@ ensure_user() {
     ACCOUNT_UID=$(id -u "$SERVICE_USER")
     say "Using the system user $SERVICE_USER that this installer created for an earlier install."
   else
-    ACCOUNT_CREATED=no
-    ACCOUNT_UID=""
-    say "Using the existing system user $SERVICE_USER. This installer did not create it, so 'uninstall --purge-key' keeps it."
+    refuse_foreign_account
   fi
+}
+
+# Stops an install on a `salvorias` account the installer cannot show it made.
+refuse_foreign_account() {
+  die "An account named '$SERVICE_USER' (UID $(id -u "$SERVICE_USER" 2>/dev/null || printf '?')) already exists, but this installer did not create it: $ACCOUNT_MARKER, which the installer leaves for an account it made, is missing or names another UID. Refusing to run the node service, and to share the node key, with an account it does not own. If nothing else uses the account, remove it ('sudo userdel $SERVICE_USER'), or rename it ('sudo usermod -l NEWNAME $SERVICE_USER' and 'sudo groupmod -n NEWNAME $SERVICE_USER'), then rerun. Nothing was changed."
+}
+
+# Read-only form of the same rule, for the start of an install.
+require_owned_account() {
+  id -u "$SERVICE_USER" >/dev/null 2>&1 || return 0
+  account_marker_matches || refuse_foreign_account
 }
 
 # True when ACCOUNT_MARKER says the current salvorias account (same UID) was
@@ -1024,6 +1074,49 @@ write_account_marker() {
   printf 'UID=%s\n' "$uid" >"$tmp"
   chmod 0600 "$tmp"
   mv -fT -- "$tmp" "$ACCOUNT_MARKER"
+}
+
+# True when the state file is one this installer wrote: a root-owned regular
+# file, in a real directory, that starts with the installer's header and has
+# a STAGE line.
+state_file_is_ours() {
+  [[ -d "$ETC_DIR" && ! -L "$ETC_DIR" && -f "$STATE_FILE" && ! -L "$STATE_FILE" ]] || return 1
+  [[ "$(stat -c '%u' -- "$STATE_FILE")" == 0 ]] || return 1
+  [[ "$(head -c 300 -- "$STATE_FILE" | head -n 1)" == "$STATE_FILE_HEADER" ]] || return 1
+  grep -q '^STAGE=' "$STATE_FILE"
+}
+
+# True when something other than the mere existence of the fixed paths shows
+# that this installer set them up: its state file, or the account marker whose
+# UID is the salvorias account's. Existence alone proves nothing: /etc/salvorias
+# or /usr/local/bin/salvorias-node could be anyone's.
+installer_proof() {
+  state_file_is_ours || account_marker_matches
+}
+
+# Stops an install that would take over a fixed path it cannot show it made:
+# it would chown and chmod a directory, replace a link or file, and a later
+# uninstall would delete it. Nothing is changed.
+refuse_unowned_paths() {
+  local p
+  installer_proof && return 0
+  for p in "$ETC_DIR" "$DATA_DIR" "$OPT_DIR" "$PATH_LINK" "$SELF_PATH"; do
+    if [[ -e "$p" || -L "$p" ]]; then
+      die "$p already exists, and nothing shows that this installer created it (no installer state file in $ETC_DIR, and no installer marker for the $SERVICE_USER account in $DATA_DIR). Refusing to take it over: the installer would change its owner and mode, or replace or delete it. Nothing was changed. If it is yours, copy anything you need from it (a node key, for one), move it aside ('sudo mv $p $p.old') or remove it, then rerun."
+    fi
+  done
+}
+
+# PATH_LINK as switch_current makes it. Anything else at that path is not ours
+# to replace or delete.
+path_link_is_ours() {
+  [[ -L "$PATH_LINK" && "$(readlink -- "$PATH_LINK")" == "$CURRENT_LINK/salvorias-node" ]]
+}
+
+# SELF_PATH as install_self_copy makes it: a regular file whose second line is
+# the installer's marker.
+self_file_is_ours() {
+  [[ -f "$SELF_PATH" && ! -L "$SELF_PATH" && "$(head -c 300 -- "$SELF_PATH" | sed -n 2p)" == "$SELF_MARKER" ]]
 }
 
 make_dirs() {
@@ -1434,7 +1527,7 @@ wait_until_ready() {
   $(cmd_hint resume)"
     else
       state="unreadable"
-      line="could not read the chain ($(json_str error)); will retry"
+      line="could not read the chain ($(clean_text "$(json_str error)")); will retry"
     fi
     if [[ "$state" != "$last_state" ]] || (( now - last_print >= 60 )); then
       say "  $(date +%H:%M:%S)  $line"
@@ -1558,8 +1651,14 @@ service_stays_up() {
   systemctl is-active --quiet "$UNIT_NAME"
 }
 
+# The journal holds the node's output, which includes text from the RPC server,
+# so every line goes through clean_text before it reaches the terminal.
 show_journal() {
-  journalctl -u "$UNIT_NAME" -n "${1:-20}" --no-pager 2>/dev/null || say "(no journal entries)"
+  local line rc=0
+  journalctl -u "$UNIT_NAME" -n "${1:-20}" --no-pager 2>/dev/null | while IFS= read -r line || [[ -n "$line" ]]; do
+    printf '%s\n' "$(clean_text -n 400 "$line")"
+  done || rc=$?
+  (( rc == 0 )) || say "(no journal entries)"
 }
 
 # ─── First check-in ────────────────────────────────────────────────────────
@@ -1598,10 +1697,10 @@ first_checkin_outcome() {
       printf 'done\n'
       return 0
     elif [[ "$msg" =~ $failed_re ]]; then
-      printf 'failed %s\n' "${BASH_REMATCH[1]}"
+      printf 'failed %s\n' "$(clean_text "${BASH_REMATCH[1]}")"
       return 0
     elif [[ "$msg" == *" skipped this cycle: "* ]]; then
-      printf 'skipped %s\n' "$msg"
+      printf 'skipped %s\n' "$(clean_text "$msg")"
       return 0
     fi
   done
@@ -1613,8 +1712,8 @@ first_checkin_outcome() {
 # funds" means the node holds some SAVDR, but less than the fee needs (the
 # install only starts the service once the balance is above zero), so it gets
 # its own wording. Otherwise ethers' wrapper ("could not coalesce error (error={ … "message": "…" },
-# payload=…)") is cut down to the node's own message. Control characters are
-# dropped: the text comes from an RPC server.
+# payload=…)") is cut down to the node's own message. The text comes from an
+# RPC server, so it goes through clean_text.
 checkin_failure_reason() {
   local raw="$1" re='"message": ?"([^"]*)"'
   if [[ "${raw,,}" == *"not eoa"* ]]; then
@@ -1630,8 +1729,7 @@ checkin_failure_reason() {
   else
     raw="${raw%% (*}"
   fi
-  raw="${raw//[^[:print:]]/}"
-  raw="${raw:0:200}"
+  raw=$(clean_text "$raw")
   while [[ "$raw" == *[.\ ] ]]; do raw="${raw%?}"; done
   printf '%s' "${raw:-no reason given}"
 }
@@ -1649,7 +1747,7 @@ print_first_checkin() {
       say "This node already checked in for the current period; the next check-in is automatic."
       ;;
     failed|skipped)
-      if [[ "$kind" == failed ]]; then rest=$(checkin_failure_reason "$rest"); else rest="${rest%.}"; fi
+      if [[ "$kind" == failed ]]; then rest=$(checkin_failure_reason "$rest"); else rest=$(clean_text "$rest"); rest="${rest%.}"; fi
       say "The first check-in failed: $rest."
       say "The node keeps retrying on its own schedule. Run $(cmd_hint status) for details."
       ;;
@@ -1712,6 +1810,8 @@ cmd_install() {
   ensure_tools
   guard_single_node
   check_existing_user
+  require_owned_account
+  refuse_unowned_paths
 
   set_network "$OPT_NETWORK"
   RPC_URL="${OPT_RPC_URL:-$NET_RPC_URL}"
@@ -1765,13 +1865,20 @@ cmd_install() {
     local rc=0
     run_slot_info "$STAGED_BIN" "$PROBE_NODE_ADDRESS" || rc=$?
     if (( rc != 0 )); then
-      die "Could not read node registration data from NodeCheckIn on $NETWORK ($(json_str error)). This must work to detect your registration. Nothing was installed. If this persists, report it with your network name."
+      die "Could not read node registration data from NodeCheckIn on $NETWORK ($(clean_text "$(json_str error)")). This must work to detect your registration. Nothing was installed. If this persists, report it with your network name."
     fi
   fi
 
   banner "Setting up this server"
+  # Again, now that the questions are answered and just before the first write.
+  require_owned_account
+  refuse_unowned_paths
   ensure_user
   make_dirs
+  # At once, not at the end of the install: a run stopped before the state
+  # file exists still leaves proof that the account and the directories are
+  # the installer's, so the next install can pick up where it stopped.
+  if [[ "$ACCOUNT_CREATED" == yes ]]; then write_account_marker; fi
   place_binary
   switch_current "$PLACED_NAME"
   say "Installed salvorias-node $STAGED_VERSION at $BIN_ROOT/$PLACED_NAME (linked from $PATH_LINK)"
@@ -1818,7 +1925,7 @@ finalize_install() {
     say ""
     say "Recent log:"
     show_journal 20
-    die "The node service could not be started (${err:0:300}). The key and settings are saved, and systemd keeps retrying the service. Fix the problem shown above, then run: $(cmd_hint resume)"
+    die "The node service could not be started ($(clean_text -n 300 "$err")). The key and settings are saved, and systemd keeps retrying the service. Fix the problem shown above, then run: $(cmd_hint resume)"
   fi
   if ! service_stays_up 10; then
     say ""
@@ -1932,7 +2039,7 @@ cmd_status() {
       say "$ACTIVE_NOTE"
     fi
   else
-    say "  Chain:     could not read the chain ($(json_str error))"
+    say "  Chain:     could not read the chain ($(clean_text "$(json_str error)"))"
   fi
 
   say ""
@@ -2089,13 +2196,21 @@ upgrade_rollback() {
   die "Rollback to $previous failed and $current is not staying up either. Check: $(cmd_hint status)"
 }
 
-# Keeps the current and previous version directories, removes the rest.
+# Keeps the current and previous version directories, removes the rest, but
+# only directories shaped like the ones place_binary makes (the binary, and
+# the temp name it is copied under). Anything else in there is not ours to
+# delete recursively.
 prune_versions() {
-  local dir name
+  local dir name other
   for dir in "$BIN_ROOT"/*; do
     [[ -d "$dir" && ! -L "$dir" ]] || continue
     name=$(basename "$dir")
     if [[ "$name" != "$1" && "$name" != "$2" ]]; then
+      other=$(find "$dir" -mindepth 1 -maxdepth 1 ! -name salvorias-node ! -name .salvorias-node.new -print -quit 2>/dev/null)
+      if [[ -n "$other" ]]; then
+        warn "Leaving $dir in place: it holds files this installer did not put there."
+        continue
+      fi
       rm -rf "${BIN_ROOT:?}/$name"
     fi
   done
@@ -2194,6 +2309,12 @@ confirm_typed() {
 cmd_uninstall() {
   require_root
   local addr=""
+  # Whether the fixed paths below are shown to be this installer's. Decided
+  # first, from the state file and the marker as they are now: the state file
+  # is removed part-way through.
+  local proven=no self_ours=0
+  if installer_proof; then proven=yes; fi
+  if self_file_is_ours; then self_ours=1; fi
   # Only read from a directory the service cannot change (the current layout).
   if [[ -d "$DATA_DIR" && ! -L "$DATA_DIR" && "$(stat -c '%u' -- "$DATA_DIR")" == 0 \
       && -f "$ADDRESS_FILE" && ! -L "$ADDRESS_FILE" ]]; then
@@ -2205,7 +2326,7 @@ cmd_uninstall() {
   # those installers set no account comment that could tell their account
   # apart from one made by hand, so the account is kept.
   local account_created=no account_why="this installer did not create it"
-  if [[ -f "$STATE_FILE" ]]; then
+  if state_file_is_ours; then
     local recorded
     recorded=$(sed -n 's/^NODE_ADDRESS=//p' "$STATE_FILE" | head -n 1)
     if is_address "$recorded"; then addr="$recorded"; fi
@@ -2223,11 +2344,30 @@ cmd_uninstall() {
   elif account_marker_matches; then
     account_created=yes
   fi
+  # Uninstall deletes $ETC_DIR and $OPT_DIR recursively, and the data
+  # directory with --purge-key. It does that only to directories this
+  # installer is shown to have made: a server that happens to have a directory
+  # of that name gets a refusal and keeps it.
+  if [[ "$proven" == no ]]; then
+    local foreign="" p
+    for p in "$ETC_DIR" "$OPT_DIR"; do
+      if [[ -e "$p" || -L "$p" ]]; then foreign+="$p "; fi
+    done
+    if (( OPT_PURGE_KEY == 1 )) && [[ -e "$DATA_DIR" || -L "$DATA_DIR" ]]; then foreign+="$DATA_DIR "; fi
+    if [[ -n "$foreign" ]]; then
+      die "${foreign% } exists, and nothing shows that this installer created it (no installer state file in $ETC_DIR, and no installer marker for the $SERVICE_USER account in $DATA_DIR). Refusing to delete it. Nothing was changed. If it is yours, inspect it and remove it by hand. If it is left over from an interrupted install, copy the node key out first (it would be $KEY_FILE), then remove it by hand."
+    fi
+  fi
+
   local unit_load unit_existed=0 strays
   unit_load=$(systemctl show -p LoadState --value "$UNIT_NAME" 2>/dev/null || true)
   if [[ -e "$UNIT_FILE" || -L "$UNIT_FILE" ]]; then unit_existed=1; fi
-  strays=$(stray_files)
-  if [[ ! -e "$STATE_FILE" && ! -e "$ENV_FILE" && ! -e "$UNIT_FILE" && ! -e "$OPT_DIR" && ! -e "$KEY_FILE" && ! -e "$SELF_PATH" \
+  strays=$(stray_files "$proven")
+  # A key in a data directory that is not shown to be ours is not this
+  # node's to report or delete.
+  local key_here=0
+  if [[ "$proven" == yes && ( -e "$KEY_FILE" || -L "$KEY_FILE" ) ]]; then key_here=1; fi
+  if [[ ! -e "$STATE_FILE" && ! -e "$ENV_FILE" && ! -e "$UNIT_FILE" && ! -e "$OPT_DIR" && "$key_here" == 0 && "$self_ours" == 0 \
       && "$unit_load" != "loaded" && -z "$strays" ]]; then
     say "Nothing to uninstall: no Salvorias self-host node found on this server."
     return 0
@@ -2292,10 +2432,17 @@ cmd_uninstall() {
   elif (( unit_existed == 1 )) || [[ "$unit_load" == "loaded" ]]; then
     say "Stopped and removed the service."
   fi
-  if [[ -L "$PATH_LINK" ]]; then rm -f "$PATH_LINK"; fi
-  rm -rf "$OPT_DIR" "$ETC_DIR"
-  say "Removed $OPT_DIR, $PATH_LINK and $ETC_DIR."
-  remove_strays
+  # Only the link switch_current makes: anything else at that path is not ours.
+  if path_link_is_ours; then
+    rm -f -- "$PATH_LINK"
+    say "Removed $OPT_DIR, $PATH_LINK and $ETC_DIR."
+  elif [[ -e "$PATH_LINK" || -L "$PATH_LINK" ]]; then
+    say "Removed $OPT_DIR and $ETC_DIR. Left $PATH_LINK alone: it is not the link this installer makes."
+  else
+    say "Removed $OPT_DIR, $PATH_LINK and $ETC_DIR."
+  fi
+  rm -rf -- "$OPT_DIR" "$ETC_DIR"
+  remove_strays "$proven"
 
   if (( OPT_PURGE_KEY == 1 )); then
     if [[ -e "$KEY_FILE" ]]; then
@@ -2309,7 +2456,7 @@ cmd_uninstall() {
       if err=$(userdel "$SERVICE_USER" 2>&1); then
         say "Deleted the $SERVICE_USER user."
       else
-        warn "Could not delete the $SERVICE_USER user (userdel: ${err:0:200}). A process may still be running as it: check with 'ps -u $SERVICE_USER', then run 'sudo userdel $SERVICE_USER'."
+        warn "Could not delete the $SERVICE_USER user (userdel: $(clean_text "$err")). A process may still be running as it: check with 'ps -u $SERVICE_USER', then run 'sudo userdel $SERVICE_USER'."
         incomplete=1
       fi
     elif id -u "$SERVICE_USER" >/dev/null 2>&1; then
@@ -2348,26 +2495,36 @@ cmd_uninstall() {
   if (( incomplete == 1 )); then
     die "The uninstall did not finish: see the warnings above. Fix them, then run: $(cmd_hint uninstall)"
   fi
-  if [[ -e "$SELF_PATH" ]]; then
-    rm -f "$SELF_PATH"
+  if (( self_ours == 1 )); then
+    rm -f -- "$SELF_PATH"
     say "Removed $SELF_PATH."
+  elif [[ -e "$SELF_PATH" || -L "$SELF_PATH" ]]; then
+    say "Left $SELF_PATH alone: it is not a copy of this installer."
   fi
 }
 
 # Files an interrupted run can leave behind: the temp copies made next to
 # salvorias-selfhost and the unit file before they are renamed into place,
-# and staging directories in DATA_DIR (which can hold a key copy).
+# and staging directories in DATA_DIR (which can hold a key copy). The data
+# directory's are listed only when it is shown to be ours (stray_files yes).
 stray_files() {
   local f
-  for f in /usr/local/sbin/.salvorias-selfhost.* /etc/systemd/system/.salvorias-node.service.* "$DATA_DIR"/.stage.*; do
+  for f in /usr/local/sbin/.salvorias-selfhost.* /etc/systemd/system/.salvorias-node.service.*; do
     if [[ -e "$f" || -L "$f" ]]; then printf '%s\n' "$f"; fi
   done
+  if [[ "${1:-no}" == yes ]]; then
+    for f in "$DATA_DIR"/.stage.*; do
+      if [[ -e "$f" || -L "$f" ]]; then printf '%s\n' "$f"; fi
+    done
+  fi
 }
 
-# Removes those leftovers. rm never follows a link. Key copies in a staging
-# directory are shredded first, but only inside a real root-owned directory
-# in a root-owned DATA_DIR: there the service account cannot swap a file for
-# a link between the find and the shred.
+# Removes those leftovers (remove_strays yes|no: whether DATA_DIR is shown to
+# be ours). rm never follows a link. Key copies in a staging directory are
+# shredded first, but only inside a real root-owned directory in a root-owned
+# DATA_DIR: there the service account cannot swap a file for a link between
+# the find and the shred. The temp copies beside the unit file and
+# salvorias-selfhost are files; a directory of that name is not ours.
 remove_strays() {
   local f n=0 data_ok=0
   if [[ -d "$DATA_DIR" && ! -L "$DATA_DIR" && "$(stat -c '%u' -- "$DATA_DIR")" == 0 ]]; then data_ok=1; fi
@@ -2378,10 +2535,14 @@ remove_strays() {
       if [[ -d "$f" && ! -L "$f" && "$(stat -c '%u' -- "$f")" == 0 ]]; then
         find "$f" -xdev -type f -links 1 \( -name 'key-*' -o -name 'node-key.txt' \) -exec shred -u {} + 2>/dev/null || true
       fi
+      rm -rf -- "$f"
+    elif [[ -d "$f" && ! -L "$f" ]]; then
+      continue
+    else
+      rm -f -- "$f"
     fi
-    rm -rf -- "$f"
     n=$((n + 1))
-  done < <(stray_files)
+  done < <(stray_files "${1:-no}")
   if (( n > 0 )); then say "Removed $n file(s) left by an interrupted run."; fi
 }
 
