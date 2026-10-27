@@ -46,7 +46,7 @@ command -v limactl >/dev/null 2>&1 || { echo "limactl is required (brew install 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Removes the staging directory, and the VM, but only one this run created.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329  # called via trap (0.9 says SC2317, 0.10+ SC2329)
 cleanup() {
   if [[ -n "$STAGE" ]]; then rm -rf "$STAGE"; fi
   if (( CREATED_VM == 1 && KEEP_VM == 0 )); then limactl delete -f "$VM" || true; fi
