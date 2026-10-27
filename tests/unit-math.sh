@@ -5,7 +5,8 @@
 # the funding text and box order, the first check-in parsing and watch, URL
 # and repo validation, checksums.txt parsing, the ELF
 # header check, the version-name pattern and an interrupt during the
-# upgrade's switch back. The functions (and the regex variables they use) are
+# upgrade's switch back, the node binary's download options and the status
+# service line. The functions (and the regex variables they use) are
 # extracted from install.sh by name, so main never runs and nothing on the
 # system is touched.
 set -euo pipefail
@@ -29,7 +30,8 @@ done
 for fn in clean_text say lower strip_zeros wei_lt warn wei_to_savdr is_uint json_str json_raw json_list \
     read_binding print_funding warn_if_unfunded is_local_http_url is_safe_url is_safe_repo checksum_for check_elf node_run \
     rule has_balance print_node_address print_setup_boxes print_funding_box missing_steps \
-    first_checkin_outcome checkin_failure_reason print_first_checkin; do
+    first_checkin_outcome checkin_failure_reason print_first_checkin \
+    set_binary_curl_opts service_state_text; do
   body=$(extract "$fn")
   [[ -n "$body" ]] || { echo "FAIL: could not extract $fn from install.sh"; exit 1; }
   src+="$body"$'\n'
@@ -866,6 +868,48 @@ w_secs=$(( $(date +%s) - w_start ))
 check "Ctrl-C during a hanging read: exit 0" "$w_rc" "0"
 check_has "Ctrl-C during a hanging read ends the watch, not the install" "$(cat "$T/watch-int2.out")" "AFTER rc=0"
 check_true "Ctrl-C during a hanging read ends the watch promptly (${w_secs}s)" test "$w_secs" -le 5
+
+echo "## status: the service line is one line, for every systemctl answer"
+# `systemctl is-enabled` prints the state AND exits non-zero for everything but
+# enabled; the line used to take its exit code for "not installed" and appended
+# a second line.
+check "unit missing (is-active inactive, is-enabled not-found)" "$(service_state_text inactive not-found)" "inactive (not installed yet)"
+check "unit missing, nothing printed at all" "$(service_state_text "" "")" "unknown (not installed yet)"
+check "disabled" "$(service_state_text inactive disabled)" "inactive (not enabled at boot)"
+check "enabled and running" "$(service_state_text active enabled)" "active (enabled at boot)"
+check "enabled, failed" "$(service_state_text failed enabled)" "failed (enabled at boot)"
+check "enabled-runtime" "$(service_state_text active enabled-runtime)" "active (enabled at boot)"
+check "masked" "$(service_state_text inactive masked)" "inactive (masked, it will not start)"
+check "masked-runtime" "$(service_state_text inactive masked-runtime)" "inactive (masked, it will not start)"
+check "static" "$(service_state_text active static)" "active (no boot setting)"
+check "an unrecognised enabled state" "$(service_state_text active bad-state)" "active (boot setting unknown)"
+check "output with a trailing newline" "$(service_state_text $'inactive\n' $'not-found\n')" "inactive (not installed yet)"
+check "extra lines are ignored" "$(service_state_text $'active\nsecond' $'enabled\nsecond')" "active (enabled at boot)"
+check "an is-active that is not a state word" "$(service_state_text 'x; rm -rf' enabled)" "unknown (enabled at boot)"
+for combo in "inactive:not-found" ":" "inactive:disabled" "active:enabled" "failed:masked" "activating:static"; do
+  line=$(service_state_text "${combo%%:*}" "${combo#*:}")
+  check_true "one line for '$combo'" test "$(printf '%s' "$line" | wc -l | tr -d ' ')" = 0
+  tail_ok=yes
+  if [[ "$line" == *" at boot" ]]; then tail_ok=no; fi
+  check "the line ends in the closing parenthesis, not 'at boot', for '$combo'" "$tail_ok" "yes"
+done
+
+echo "## node binary download options"
+set_binary_curl_opts no
+quiet_opts=" ${CURL_DL_OPTS[*]} "
+set_binary_curl_opts yes
+bar_opts=" ${CURL_DL_OPTS[*]} "
+check_has "no terminal: errors still print but no meter (-fsSL)" "$quiet_opts" " -fsSL "
+check_lacks "no terminal: no progress bar" "$quiet_opts" "--progress-bar"
+check_has "terminal: curl's progress bar" "$bar_opts" " --progress-bar "
+check_has "terminal: fail on HTTP errors, show errors, follow redirects (-fSL)" "$bar_opts" " -fSL "
+check_lacks "terminal: no -s that would hide the bar" "$bar_opts" " -fsSL "
+for opts in "$quiet_opts" "$bar_opts"; do
+  check_has "stall check: under 1 KB/s ..." "$opts" " --speed-limit 1024 "
+  check_has "stall check: ... for 2 minutes aborts" "$opts" " --speed-time 120 "
+  check_has "overall cap is an hour, not 300 seconds" "$opts" " --max-time 3600 "
+  check_has "retries kept" "$opts" " --retry 3 "
+done
 
 echo "unit-math: $fails failed"
 [[ "$fails" -eq 0 ]]

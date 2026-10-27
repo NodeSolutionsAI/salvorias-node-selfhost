@@ -434,6 +434,16 @@ section "4. release download path: checksum verified / refused"
 run download-ok env SALVORIAS_RELEASE_BASE_URL=http://127.0.0.1:8000 bash "$INSTALL" --network testnet --owner "$OWNER"
 expect_rc 3 "downloaded binary verified, then no-license stop"
 expect_log download-ok 'Checksum verified: salvorias-node-' "checksum verified message"
+# Non-TTY (run captures stdout and stderr into a file): curl's progress bar
+# and meter must not reach logs, CI output or a redirected install.
+expect_log download-ok 'Downloading salvorias-node-' "the download is announced"
+expect_no_log download-ok '#####|[0-9]+(\.[0-9])?%|% Total|Dload' "no progress bar or meter in captured (non-terminal) output"
+# With a terminal on stderr (script gives stdout and stderr a pty; stdin is a
+# pipe, like `curl ... | sudo bash`), the bar shows.
+run download-tty with_tty "" "env SALVORIAS_RELEASE_BASE_URL=http://127.0.0.1:8000 bash $INSTALL --network testnet --owner $OWNER"
+expect_rc 3 "download with a terminal: verified, then no-license stop"
+expect_log download-tty '#####|100\.0%' "progress bar shown when stderr is a terminal"
+expect_log download-tty 'Checksum verified: salvorias-node-' "download with a terminal is still verified"
 run download-crlf env SALVORIAS_RELEASE_BASE_URL=http://127.0.0.1:8003 bash "$INSTALL" --network testnet --owner "$OWNER"
 expect_rc 3 "CRLF checksums.txt with *name entries verifies"
 expect_log download-crlf 'Checksum verified: salvorias-node-' "verified through the CRLF file"
@@ -500,6 +510,15 @@ expect_log replaced-reinstall 'STOPPED: Waited 1 min\. The node is funded but no
 # most one once-a-minute repeat), not one per poll.
 progress_lines=$(grep -cE '^  [0-9:]{8}  registered: ' "$OUT/replaced-reinstall.log" || true)
 expect_true "progress is printed on change or once a minute, not every poll ($progress_lines lines)" test "$progress_lines" -ge 1 -a "$progress_lines" -le 2
+# The wait timed out before the service unit was written: status here used to
+# print "Service:   inactive, not-found" and then "not installed at boot" on a
+# line of its own.
+expect_true "no service unit exists yet (the wait timed out before it was written)" test ! -e /etc/systemd/system/salvorias-node.service
+run status-no-unit "$SELF" status
+expect_rc 0 "status before the service unit exists"
+expect_log status-no-unit '^  Service: +inactive \(not installed yet\)$' "status says plainly that the service is not installed yet"
+expect_true "the Service entry is a single line (the next line is Version)" bash -c "grep -A1 '^  Service:' '$OUT/status-no-unit.log' | tail -n 1 | grep -q '^  Version:'"
+expect_no_log status-no-unit '^(not installed|not-found|disabled|enabled)' "no stray enabled-state text on a line of its own"
 rm -f "$FAITHFUL_STATE/replaced-by"
 # The mock refuses this run's first check-in the way the chain refuses a
 # balance too small for the fee.
@@ -876,6 +895,8 @@ mv "$WORK/saved-lock" "$LOCK"
 section "11. status (unfunded, then funded through the mock)"
 run status "$SELF" status
 expect_rc 0 "status"
+expect_log status '^  Service: +[a-z-]+ \([a-z ,]+\)$' "status: the service state is one line, state then boot setting in parentheses"
+expect_no_log status '^(not installed|not-found|disabled|enabled)|^[a-z-]+ at boot$' "status: no enabled-state text on a line of its own"
 expect_log status '^  Registered: yes \(to the owner\)$' "status shows the registration, without a slot number"
 expect_log status '^  Funded: +NO \(0 SAVDR; send 1 SAVDR to the node address\)$' "status shows the node unfunded"
 expect_no_log status 'show Active in the Salvorias app' "no Active note while the node cannot check in"
@@ -890,6 +911,13 @@ expect_log status-funded '^  Registered: yes \(to the owner\)$' "funded status: 
 expect_log status-funded '^  Funded: +yes \(1 SAVDR\)$' "funded status: the balance in SAVDR"
 expect_log status-funded "$ACTIVE_NOTE_RE" "status carries the Active note once registered and funded"
 expect_no_log status-funded 'will not check in until it holds' "no zero-balance warning once funded"
+# A real unit that is not enabled: is-enabled prints "disabled" and exits 1.
+systemctl disable salvorias-node.service >/dev/null 2>&1
+run status-disabled "$SELF" status
+systemctl enable salvorias-node.service >/dev/null 2>&1
+expect_log status-disabled '^  Service: +[a-z]+ \(not enabled at boot\)$' "status: a disabled service reads as one line"
+expect_no_log status-disabled '^disabled|^not installed' "status: no stray text for a disabled service"
+expect_true "the service is enabled again after the status check" systemctl is-enabled --quiet salvorias-node.service
 
 section "12. backup-key"
 run backup "$SELF" backup-key --out /root/node-key-backup.txt
