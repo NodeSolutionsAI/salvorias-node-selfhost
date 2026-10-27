@@ -88,7 +88,8 @@ The default network is **mainnet**. To try it on testnet first, add
 
 1. **Checks** the server: root, Linux, systemd, CPU type, and that it can
    reach the Salvorias RPC. It also confirms the RPC is on the right chain.
-2. **Downloads** the node binary for your CPU and verifies its checksum.
+2. **Downloads** the node binary for your CPU (about 110 MB; a progress bar
+   shows when you run it in a terminal) and verifies its checksum.
 3. **Asks for your license wallet address** (or takes `--owner 0x...`).
 4. **Checks your license on-chain.**
    - If the wallet holds no license, it stops. Nothing has been installed

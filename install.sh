@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-INSTALLER_VERSION="0.1.0"
+INSTALLER_VERSION="0.1.1"
 
 # ─── Configuration (environment overrides) ────────────────────────────────
 
@@ -555,16 +555,45 @@ fetch_checksums() {
   CHECKSUMS_FILE="$TMP_DIR/checksums.txt"
 }
 
-# download_verified ASSET DEST: downloads a release asset and checks it
-# against checksums.txt. Any mismatch or missing entry aborts the run.
+# set_binary_curl_opts SHOW: sets CURL_DL_OPTS, the curl options for the node
+# binary download (about 110 MB), the one download where a slow link is
+# realistic. SHOW is "yes" when stderr is a terminal.
+#  - Progress: curl's own bar, on stderr, only for a person watching. Without
+#    -s curl would draw its meter into logs and CI output too, so every other
+#    case keeps -s (and -S keeps the errors).
+#  - Time limits: a fixed short --max-time killed healthy but slow downloads
+#    (at 0.4 MB/s the file needs about 5 minutes). Instead it gives up when the
+#    speed stays under 1 KB/s for 2 minutes, with a generous hour as the
+#    overall cap per attempt. A stall is a timeout, so --retry covers it.
+set_binary_curl_opts() {
+  CURL_DL_OPTS=(--retry 3 --speed-limit 1024 --speed-time 120 --max-time 3600)
+  if [[ "$1" == yes ]]; then
+    CURL_DL_OPTS+=(-fSL --progress-bar)
+  else
+    CURL_DL_OPTS+=(-fsSL)
+  fi
+}
+
+# download_verified ASSET DEST [binary]: downloads a release asset and checks
+# it against checksums.txt. Any mismatch or missing entry aborts the run. The
+# optional third word "binary" selects the long-download behaviour above;
+# every other file keeps the short quiet download.
 download_verified() {
-  local asset="$1" dest="$2" base expected actual
+  local asset="$1" dest="$2" kind="${3:-}" base expected actual show=no
   fetch_checksums
   base=$(release_base_url)
   expected=$(checksum_for "$asset" "$CHECKSUMS_FILE") \
     || die "checksums.txt at $base has no single valid entry for $asset. Refusing to install an unverified file."
   say "Downloading $asset ..."
-  if ! curl_safe -fsSL --retry 3 --max-time 300 -o "$dest" "$base/$asset"; then
+  if [[ "$kind" == binary ]]; then
+    if [[ -t 2 ]]; then show=yes; fi
+    set_binary_curl_opts "$show"
+  else
+    CURL_DL_OPTS=(-fsSL --retry 3 --max-time 300)
+  fi
+  if ! curl_safe "${CURL_DL_OPTS[@]}" -o "$dest" "$base/$asset"; then
+    # The bar leaves the cursor mid-line; put the error on its own line.
+    if [[ "$show" == yes ]]; then printf '\n' >&2; fi
     rm -f "$dest"
     die "Could not download $base/$asset."
   fi
@@ -594,7 +623,7 @@ stage_binary() {
     say "Using local binary $OPT_BINARY"
     say "  sha256 $(sha256sum "$STAGED_BIN" | awk '{ print $1 }') (not checked against a release; compare it yourself)"
   else
-    download_verified "salvorias-node-$ASSET_ARCH" "$STAGED_BIN"
+    download_verified "salvorias-node-$ASSET_ARCH" "$STAGED_BIN" binary
     chmod 0755 "$STAGED_BIN"
   fi
   check_elf "$STAGED_BIN" || die "The node binary cannot be used on this server: $ELF_PROBLEM. Nothing was changed."
@@ -2023,13 +2052,34 @@ cmd_resume() {
 
 # ─── status ────────────────────────────────────────────────────────────────
 
+# service_state_text ACTIVE ENABLED: the service state as one line of plain
+# words, from the output of `systemctl is-active` and `systemctl is-enabled`
+# (either may be empty or have several lines; only the first word is used).
+service_state_text() {
+  local active enabled boot
+  read -r active _ <<<"$1" || true
+  read -r enabled _ <<<"$2" || true
+  [[ "$active" =~ ^[a-z-]+$ ]] || active="unknown"
+  case "$enabled" in
+    enabled|enabled-runtime) boot="enabled at boot" ;;
+    disabled) boot="not enabled at boot" ;;
+    masked|masked-runtime) boot="masked, it will not start" ;;
+    static|indirect|generated|alias|transient) boot="no boot setting" ;;
+    ""|not-found) boot="not installed yet" ;;
+    *) boot="boot setting unknown" ;;
+  esac
+  printf '%s (%s)' "$active" "$boot"
+}
+
 cmd_status() {
   require_root
   load_state
   banner "Salvorias node status"
   say "  Network:   $NETWORK (chain $NET_CHAIN_ID, $RPC_URL)"
   say "  Install:   $ST_STAGE"
-  say "  Service:   $(systemctl is-active "$UNIT_NAME" 2>/dev/null || true), $(systemctl is-enabled "$UNIT_NAME" 2>/dev/null || printf 'not installed') at boot"
+  # No `|| printf` fallback on is-enabled: it exits non-zero for every state
+  # except enabled, yet still prints the state (not-found, disabled, masked).
+  say "  Service:   $(service_state_text "$(systemctl is-active "$UNIT_NAME" 2>/dev/null || true)" "$(systemctl is-enabled "$UNIT_NAME" 2>/dev/null || true)")"
   say "  Version:   $(node_run 30 "$PATH_LINK" version </dev/null 2>/dev/null || printf 'binary missing') ($(current_version_name))"
   say "  Node:      $NODE_ADDRESS"
   say "  Owner:     $OWNER"

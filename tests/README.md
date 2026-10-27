@@ -30,7 +30,10 @@ Active note, and the watch itself, with the real `timeout` and stand-in
 systemctl and journalctl executables (it ends on a result; with stand-ins
 that hang 30s it still ends within its 1-3s limit plus 2s; it never changes
 the exit code; Ctrl-C ends the watch but not the install, also while a
-journal read hangs), the URL and repo rules, `checksums.txt` parsing (empty file, missing entry,
+journal read hangs), the `Service:` line of `status` for every `systemctl`
+answer (missing unit, disabled, enabled, masked, static, empty) and the node
+binary's curl options (progress bar only for a terminal, a stall check instead
+of a short time limit), the URL and repo rules, `checksums.txt` parsing (empty file, missing entry,
 `*name` entries, CRLF, conflicting entries), the ELF header check, and the
 version-name pattern (no `..`, leading dot or dash, or slash), the
 `openSlots` reader (a missing or malformed list stops the install; only `[]`
@@ -150,6 +153,9 @@ messages, files, owners and modes.
   - release downloads: a checksum that verifies, a CRLF `checksums.txt` with
     `*name` entries that verifies, and a tampered binary, an empty
     `checksums.txt` and a missing entry that are each refused.
+    No progress bar or meter reaches captured output; run under a
+    pseudo-terminal (`script`, stdin a pipe as in `curl | sudo bash`), the bar
+    shows and the download is still verified;
 - **The testnet contract as deployed** (no `nodeToSlot` getter):
   - `slot-info --node` against https://testnet.salvorias.net itself
     (read-only) succeeds;
@@ -226,6 +232,9 @@ messages, files, owners and modes.
     while `status` still runs. A link at the lock path is refused and its
     target is untouched. During the Ctrl-C upgrade test below, an
     `uninstall --yes` started while the upgrade runs is refused the same way;
+  - `status` before the service unit exists, and with the unit disabled: the
+    `Service:` entry is one line (`inactive (not installed yet)`, `inactive
+    (not enabled at boot)`), with no enabled-state text on a line of its own;
   - `status`, unfunded (`Funded: NO`, the zero-balance warning, no Active
     note) and funded (`Registered: yes`, `Funded: yes (1 SAVDR)`, the Active
     note);
