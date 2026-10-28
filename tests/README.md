@@ -58,8 +58,14 @@ binary runs with (a stand-in binary prints what it received). Three more groups:
   `/var/lib`, a read-only data directory, a full disk: small tmpfs mounts under
   the temp root) stops `ensure_user` with the recovery message, leaves no
   marker or staging file, and the recovery it gives (free space, `userdel`,
-  rerun) works. The install's second write after `make_dirs` goes on when a
-  valid marker is already in place and stops when there is none.
+  rerun) works. So does one forced not to read back (it is removed again),
+  and a staging file that cannot be removed is named in a warning, with the
+  extra recovery step for the data directory it keeps. The install's second
+  write after `make_dirs` goes on when a valid marker is already in place and
+  stops when there is none. The uninstall that keeps the key
+  (`record_kept_account`) warns when the marker does not end up proving the
+  account (data directory missing or not root-owned, failed write, no
+  read-back), and the fix it prints is run and checked.
   `switch_current` and `install_self_copy` leave a foreign file or
   link in `/usr/local` alone; `prune_versions` and `remove_strays` do not
   delete directories they cannot show are the installer's.

@@ -1069,18 +1069,17 @@ ensure_user() {
     useradd --system --user-group --no-create-home --home-dir /nonexistent --shell "$nologin" "$SERVICE_USER"
     # From here a failure must stop the run with the way out, not leave an
     # account that the next install refuses. A DATA_DIR this made is removed
-    # again (rmdir: it holds nothing then), or the next install would refuse
-    # it as unproven; the userdel the message asks for is then all it needs.
+    # again, or the next install would refuse it as unproven; the userdel the
+    # message asks for is then all it needs.
     local made_dir=0 err
     if [[ ! -e "$DATA_DIR" && ! -L "$DATA_DIR" ]]; then
       made_dir=1
       if ! err=$(install -d -m 0750 -o root -g "$SERVICE_USER" "$DATA_DIR" 2>&1); then
-        rmdir -- "$DATA_DIR" 2>/dev/null || true
-        die_account_marker "could not create $DATA_DIR: $(clean_text "$err")"
+        die_account_marker "could not create $DATA_DIR: $(clean_text "$err")" "$(undo_new_data_dir)"
       fi
     fi
     if ! write_account_marker; then
-      if (( made_dir == 1 )); then rmdir -- "$DATA_DIR" 2>/dev/null || true; fi
+      if (( made_dir == 1 )); then die_account_marker "$MARKER_ERROR" "$(undo_new_data_dir)"; fi
       die_account_marker "$MARKER_ERROR"
     fi
     trap - INT TERM HUP
@@ -1145,22 +1144,61 @@ write_account_marker() {
     return 1
   fi
   if ! err=$({ printf 'UID=%s\n' "$uid" >"$tmp" && chmod 0600 "$tmp" && mv -fT -- "$tmp" "$ACCOUNT_MARKER"; } 2>&1); then
-    rm -f -- "$tmp"
     MARKER_ERROR=$(clean_text "${err:-the write failed}")
+    remove_marker_file "$tmp" "the unfinished marker"
     return 1
   fi
+  # A marker that does not prove the account is worse than none: it would
+  # keep DATA_DIR from being removed again, and the next install refuses
+  # that. It is the file just renamed into a root-owned DATA_DIR, so ours.
   if ! account_marker_matches; then
     MARKER_ERROR="it was written but does not read back as UID=$uid"
+    remove_marker_file "$ACCOUNT_MARKER" "the marker that did not read back"
     return 1
   fi
+}
+
+# remove_marker_file PATH WHAT: removes a file write_account_marker made. rm
+# removes a link itself and never follows it. When it cannot, the path is
+# named so the operator can remove it by hand.
+remove_marker_file() {
+  if [[ ! -e "$1" && ! -L "$1" ]] || rm -f -- "$1" 2>/dev/null; then return 0; fi
+  warn "Could not remove $2, $1. Remove it with 'sudo rm -f $1'."
+}
+
+# After a failed marker write for a new account: removes the DATA_DIR that
+# ensure_user has just made (rmdir, so only while it is empty) and prints
+# nothing. When it cannot, prints the extra step for die_account_marker.
+undo_new_data_dir() {
+  if [[ ! -e "$DATA_DIR" && ! -L "$DATA_DIR" ]] || rmdir -- "$DATA_DIR" 2>/dev/null; then return 0; fi
+  printf "This run also made %s and could not remove it again: remove it with 'sudo rm -r %s' before you rerun, or the next install will refuse it." "$DATA_DIR" "$DATA_DIR"
 }
 
 # Stops an install whose new account could not get its marker. Carrying on
 # would leave an account the next install cannot prove is its own, and so
 # refuses. Always this run's account: one reused from an earlier install has a
-# valid marker, and the rename above never replaces it with a broken one.
+# valid marker, which the install never rewrites.
+# die_account_marker WHY [EXTRA]: EXTRA is one more recovery step.
 die_account_marker() {
-  die "Could not write $ACCOUNT_MARKER, the record that this installer created the '$SERVICE_USER' account ($1). Stopping here: without it the next install could not prove the account is its own and would refuse it. The disk may be full or $DATA_DIR read-only (check with 'df -h $DATA_DIR' and 'findmnt -T $DATA_DIR'). Free space or fix that, then remove the account this run created with 'sudo userdel $SERVICE_USER' (it removes the group too), and rerun."
+  die "Could not write $ACCOUNT_MARKER, the record that this installer created the '$SERVICE_USER' account ($1). Stopping here: without it the next install could not prove the account is its own and would refuse it. The disk may be full or $DATA_DIR read-only (check with 'df -h $DATA_DIR' and 'findmnt -T $DATA_DIR'). Free space or fix that, then remove the account this run created with 'sudo userdel $SERVICE_USER' (it removes the group too), and rerun.${2:+ $2}"
+}
+
+# The uninstall that keeps the key removes the state file, so from then on
+# only ACCOUNT_MARKER shows the next install that the kept account (and key)
+# are this installer's. Writes it, then checks that it really proves the
+# account: write_account_marker writes nothing when DATA_DIR is missing or not
+# root-owned, which no release leaves behind but a hand-edited server can.
+# Anything short of proof gets a warning with the fix, not a stop: the
+# uninstall itself is done by then.
+record_kept_account() {
+  local why=""
+  if ! write_account_marker; then
+    why=$MARKER_ERROR
+  elif ! account_marker_matches; then
+    why="$DATA_DIR is missing or not owned by root, so the marker was not written"
+  fi
+  if [[ -z "$why" ]]; then return 0; fi
+  warn "Could not write $ACCOUNT_MARKER, the record that this installer created the '$SERVICE_USER' account ($why). Without it a later install will refuse the account and the kept key. Free space on the disk if it is full, then write it with: sudo install -d -m 0750 -o root -g $SERVICE_USER $DATA_DIR && echo 'UID=$(id -u "$SERVICE_USER" 2>/dev/null || printf '?')' | sudo tee $ACCOUNT_MARKER >/dev/null"
 }
 
 # True when the state file is one this installer wrote: a root-owned regular
@@ -1965,12 +2003,13 @@ cmd_install() {
   make_dirs
   # ensure_user wrote the marker for a new account before any of this. This
   # call covers a DATA_DIR that existed but was not root-owned then (an older
-  # layout), which make_dirs has just fixed; it rewrites the same marker.
-  # A failed rewrite is harmless while the marker already in place still
-  # proves the account (the rename never replaces it with a partial one);
-  # with no valid marker at all, the install stops as ensure_user would.
+  # layout), which make_dirs has just fixed. A marker that already proves the
+  # account is left as it is: rewriting it would only add a way to lose it
+  # (a write that does not read back is removed). With no valid marker, a
+  # failed write stops the install as in ensure_user; the account is then
+  # always this run's, since a reused one is reused only on a valid marker.
   if [[ "$ACCOUNT_CREATED" == yes ]]; then
-    write_account_marker || account_marker_matches || die_account_marker "$MARKER_ERROR"
+    account_marker_matches || write_account_marker || die_account_marker "$MARKER_ERROR"
   fi
   place_binary
   switch_current "$PLACED_NAME"
@@ -2581,10 +2620,8 @@ cmd_uninstall() {
   fi
   # The state file is gone now; the marker carries "this installer created
   # the account" to the next install, which reuses the kept key and account.
-  # Everything else is removed by now, so a failed write is reported with the
-  # one-line fix rather than stopping the uninstall.
-  if (( OPT_PURGE_KEY == 0 )) && [[ "$account_created" == "yes" ]] && ! write_account_marker; then
-    warn "Could not write $ACCOUNT_MARKER, the record that this installer created the '$SERVICE_USER' account ($MARKER_ERROR). Without it a later install will refuse the account and the kept key. Free space on the disk or fix $DATA_DIR, then write it with: echo 'UID=$(id -u "$SERVICE_USER" 2>/dev/null || printf '?')' | sudo tee $ACCOUNT_MARKER >/dev/null"
+  if (( OPT_PURGE_KEY == 0 )) && [[ "$account_created" == "yes" ]]; then
+    record_kept_account
   fi
 
   # The license is not freed by an uninstall, and the app counts this node as
