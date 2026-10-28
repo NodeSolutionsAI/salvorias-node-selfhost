@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-INSTALLER_VERSION="0.1.1"
+INSTALLER_VERSION="0.1.2"
 
 # ─── Configuration (environment overrides) ────────────────────────────────
 
