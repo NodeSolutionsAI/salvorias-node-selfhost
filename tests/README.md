@@ -65,7 +65,9 @@ binary runs with (a stand-in binary prints what it received). Three more groups:
   stops when there is none. The uninstall that keeps the key
   (`record_kept_account`) warns when the marker does not end up proving the
   account (data directory missing or not root-owned, failed write, no
-  read-back), and the fix it prints is run and checked.
+  read-back), and the fix it prints is run and checked, including with a link
+  planted at the marker path (to a file and to a directory): the link is
+  replaced and its target left untouched.
   `switch_current` and `install_self_copy` leave a foreign file or
   link in `/usr/local` alone; `prune_versions` and `remove_strays` do not
   delete directories they cannot show are the installer's.

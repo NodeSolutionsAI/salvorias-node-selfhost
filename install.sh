@@ -1198,7 +1198,15 @@ record_kept_account() {
     why="$DATA_DIR is missing or not owned by root, so the marker was not written"
   fi
   if [[ -z "$why" ]]; then return 0; fi
-  warn "Could not write $ACCOUNT_MARKER, the record that this installer created the '$SERVICE_USER' account ($why). Without it a later install will refuse the account and the kept key. Free space on the disk if it is full, then write it with: sudo install -d -m 0750 -o root -g $SERVICE_USER $DATA_DIR && echo 'UID=$(id -u "$SERVICE_USER" 2>/dev/null || printf '?')' | sudo tee $ACCOUNT_MARKER >/dev/null"
+  # The fix writes the marker as write_account_marker does, so that nothing
+  # placed at the marker path is written through: the directory is made
+  # root-only first (from then on only root can put anything in it), the
+  # content goes into a new file mktemp creates exclusively (root, 0600), and
+  # mv -T renames that over whatever is at the marker path, replacing a link
+  # rather than following it.
+  local uid
+  uid=$(id -u "$SERVICE_USER" 2>/dev/null || printf '?')
+  warn "Could not write $ACCOUNT_MARKER, the record that this installer created the '$SERVICE_USER' account ($why). Without it a later install will refuse the account and the kept key. Free space on the disk if it is full, then write it with: sudo install -d -m 0750 -o root -g $SERVICE_USER $DATA_DIR && t=\$(sudo mktemp $DATA_DIR/.stage.XXXXXX) && echo 'UID=$uid' | sudo tee \"\$t\" >/dev/null && sudo mv -fT \"\$t\" $ACCOUNT_MARKER"
 }
 
 # True when the state file is one this installer wrote: a root-owned regular

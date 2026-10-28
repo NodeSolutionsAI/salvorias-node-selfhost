@@ -835,10 +835,31 @@ if account_marker_matches; then echo marker-ok; fi')
     check_has "kept key, data directory $kind: a warning, not silence" "$out" "WARNING: Could not write $r/var/salvorias/installer-account.txt"
     check_has "kept key, data directory $kind: the cause is named" "$out" "$r/var/salvorias is missing or not owned by root, so the marker was not written"
     check_has "kept key, data directory $kind: the uninstall goes on" "$out" "uninstall-went-on"
-    check_has "kept key, data directory $kind: the fix is given" "$out" "write it with: sudo install -d -m 0750 -o root -g $NEW_ACCT $r/var/salvorias && echo 'UID=$new_uid' | sudo tee $r/var/salvorias/installer-account.txt >/dev/null"
-    kept_fix "$out"
+    check_has "kept key, data directory $kind: the fix is given" "$out" "write it with: sudo install -d -m 0750 -o root -g $NEW_ACCT $r/var/salvorias && t=\$(sudo mktemp $r/var/salvorias/.stage.XXXXXX) && echo 'UID=$new_uid' | sudo tee \"\$t\" >/dev/null && sudo mv -fT \"\$t\" $r/var/salvorias/installer-account.txt"
+    check_true "kept key, data directory $kind: the printed fix runs" kept_fix "$out"
     out=$(own_try "$r" "$NEW_ACCT" <<<'if account_marker_matches; then echo marker-ok; fi')
     check_has "kept key, data directory $kind: the fix makes the marker prove the account" "$out" "marker-ok"
+  done
+  # The printed fix never writes through what is already at the marker path:
+  # a link the service planted while it owned the directory, to a root-owned
+  # file or to a directory, is replaced, and its target is untouched.
+  for target in file dir; do
+    r=$(own_new "kept-link-$target"); mkdir -p "$r/var/salvorias"
+    if [[ "$target" == file ]]; then printf 'precious\n' >"$r/victim"; else mkdir "$r/victim"; fi
+    ln -s "$r/victim" "$r/var/salvorias/installer-account.txt"
+    chown -h "$NEW_ACCT:$NEW_ACCT" "$r/var/salvorias" "$r/var/salvorias/installer-account.txt"; chmod 0700 "$r/var/salvorias"
+    out=$(kept_try "$r")
+    check_has "kept key, a planted link to a $target: a warning with the fix" "$out" "write it with: sudo install -d"
+    check_true "kept key, a planted link to a $target: the printed fix runs" kept_fix "$out"
+    if [[ "$target" == file ]]; then
+      check "kept key, a planted link to a file: the file it points to is unchanged" "$(cat "$r/victim")" "precious"
+    else
+      check "kept key, a planted link to a directory: nothing is written into it" "$(find "$r/victim" -mindepth 1 | wc -l | tr -d ' ')" "0"
+    fi
+    check_false "kept key, a planted link to a $target: the link is gone" test -L "$r/var/salvorias/installer-account.txt"
+    check "kept key, a planted link to a $target: the marker is root:root 600, as the installer makes it" "$(stat -c '%U:%G %a' "$r/var/salvorias/installer-account.txt")" "root:root 600"
+    out=$(own_try "$r" "$NEW_ACCT" <<<'if account_marker_matches; then echo marker-ok; fi')
+    check_has "kept key, a planted link to a $target: the marker proves the account" "$out" "marker-ok"
   done
   r=$(own_new kept-fail); install -d -m 0750 -o root -g "$NEW_ACCT" "$r/var/salvorias"
   out=$(kept_try "$r" "$fail_mv; ")
