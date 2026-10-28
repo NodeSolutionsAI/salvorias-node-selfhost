@@ -54,7 +54,13 @@ binary runs with (a stand-in binary prints what it received). Three more groups:
   its marker is refused by `require_owned_account` and `ensure_user`; with it,
   reused. `ensure_user` on a new account writes the marker itself, before any
   other directory exists, and puts the caller's INT handler back; the next
-  install reuses the account. `switch_current` and `install_self_copy` leave a foreign file or
+  install reuses the account. A marker that cannot be written (a read-only
+  `/var/lib`, a read-only data directory, a full disk: small tmpfs mounts under
+  the temp root) stops `ensure_user` with the recovery message, leaves no
+  marker or staging file, and the recovery it gives (free space, `userdel`,
+  rerun) works. The install's second write after `make_dirs` goes on when a
+  valid marker is already in place and stops when there is none.
+  `switch_current` and `install_self_copy` leave a foreign file or
   link in `/usr/local` alone; `prune_versions` and `remove_strays` do not
   delete directories they cannot show are the installer's.
 - The real `on_signal` and `undo_upgrade` with a slowed `switch_current`,
