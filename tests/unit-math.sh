@@ -156,7 +156,16 @@ done
 
 echo "## checksums.txt parsing"
 T="$(mktemp -d)"
-trap 'rm -rf "$T"' EXIT
+# The ownership tests mount small file systems under $T (a full disk, a
+# read-only one); they are unmounted before $T is removed, even on a failure.
+UNIT_MOUNTS=""
+# shellcheck disable=SC2317,SC2329  # called via trap (0.9 says SC2317, 0.10+ SC2329)
+unit_cleanup() {
+  local m
+  for m in $UNIT_MOUNTS; do umount -l "$m" 2>/dev/null || true; done
+  rm -rf "$T"
+}
+trap unit_cleanup EXIT
 H1="$(printf 'a%.0s' {1..64})"
 H2="$(printf 'b%.0s' {1..64})"
 : >"$T/empty"
@@ -593,7 +602,8 @@ else
         "SERVICE_USER=$acct" 'ACCOUNT_CREATED="" ACCOUNT_UID="" OPT_SELF="" RUNNING_FILE="" OPT_BINARY=""'
       extract_var STATE_FILE_HEADER
       extract_var SELF_MARKER
-      for f in say warn state_file_is_ours account_marker_matches write_account_marker installer_proof refuse_unowned_paths refuse_foreign_account \
+      for f in say warn clean_text state_file_is_ours account_marker_matches write_account_marker remove_marker_file undo_new_data_dir \
+          die_account_marker record_kept_account installer_proof refuse_unowned_paths refuse_foreign_account \
           require_owned_account ensure_user path_link_is_ours self_file_is_ours switch_current prune_versions stray_files remove_strays; do
         extract "$f"
       done
@@ -700,6 +710,166 @@ echo "data=$(stat -c "%a %U:%G" "$DATA_DIR")"')
   r=$(own_new acct-new-trap)
   out=$(own_try "$r" "$NEW_ACCT" <<<'on_signal() { :; }; trap on_signal INT; ensure_user >/dev/null; trap -p INT')
   check_has "the caller's INT handler is back after ensure_user" "$out" "trap -- 'on_signal' SIGINT"
+  userdel "$NEW_ACCT" 2>/dev/null || true
+
+  echo "# a marker that cannot be written stops the install"
+  # Real failures, on small file systems mounted where the data directory
+  # goes: a read-only one, and a full one. As root, permissions alone would
+  # not stop the write.
+  own_mount() { mkdir -p "$1"; mount -t tmpfs -o "$2" tmpfs "$1"; UNIT_MOUNTS="$1 $UNIT_MOUNTS"; }
+  own_umount() { umount "$1"; UNIT_MOUNTS="${UNIT_MOUNTS//"$1 "/}"; }
+  stage_files() { find "$1" -name '.stage.*' 2>/dev/null | wc -l | tr -d ' '; }
+  marker_fail_checks() {   # NAME OUTPUT ROOT
+    check_has "$1: the install stops with the marker named" "$2" "DIE: Could not write $3/var/salvorias/installer-account.txt, the record that this installer created the '$NEW_ACCT' account"
+    check_has "$1: it says why the next install needs it" "$2" "the next install could not prove the account is its own"
+    check_has "$1: and how to recover" "$2" "Free space or fix that, then remove the account this run created with 'sudo userdel $NEW_ACCT'"
+    check_lacks "$1: ensure_user does not report the account as set up" "$2" "Created system user"
+    check_lacks "$1: nothing after ensure_user runs" "$2" "after-ensure-user"
+    check_has "$1: exit status 1" "$2" "rc=1"
+    check_false "$1: no marker is left that reads as valid" test -e "$3/var/salvorias/installer-account.txt"
+    check "$1: no staging file is left" "$(stage_files "$3/var")" "0"
+  }
+  if id -u "$NEW_ACCT" >/dev/null 2>&1; then userdel "$NEW_ACCT"; fi
+  # /var/lib read-only: the data directory itself cannot be made.
+  r=$(own_new marker-ro-parent); own_mount "$r/var" ro,mode=0755
+  out=$(own_try "$r" "$NEW_ACCT" <<<'ensure_user; echo after-ensure-user')
+  marker_fail_checks "read-only /var/lib" "$out" "$r"
+  check_has "read-only /var/lib: the cause is named" "$out" "could not create $r/var/salvorias:"
+  check_true "read-only /var/lib: the account exists, as the message says" bash -c 'id -u "$1" >/dev/null' _ "$NEW_ACCT"
+  own_umount "$r/var"; userdel "$NEW_ACCT" 2>/dev/null || true
+  # A read-only data directory that already exists: no staging file can be made.
+  r=$(own_new marker-ro-data); own_mount "$r/var/salvorias" ro,mode=0750
+  out=$(own_try "$r" "$NEW_ACCT" <<<'ensure_user; echo after-ensure-user')
+  marker_fail_checks "read-only data directory" "$out" "$r"
+  check_has "read-only data directory: the cause is named" "$out" "could not create a file in $r/var/salvorias:"
+  check_true "read-only data directory: one it did not make is left in place" test -d "$r/var/salvorias"
+  own_umount "$r/var/salvorias"; userdel "$NEW_ACCT" 2>/dev/null || true
+  # A full disk: the directory and the staging file are made, the write fails.
+  r=$(own_new marker-full); own_mount "$r/var" size=8k,mode=0755
+  head -c 8192 /dev/zero >"$r/var/fill" 2>/dev/null || true
+  out=$(own_try "$r" "$NEW_ACCT" <<<'ensure_user; echo after-ensure-user')
+  marker_fail_checks "full disk" "$out" "$r"
+  check_has "full disk: the cause is named" "$out" "No space left on device"
+  check_false "full disk: the data directory it made is removed again" test -e "$r/var/salvorias"
+  # The recovery the message gives: free space, userdel, rerun.
+  rm -f "$r/var/fill"; userdel "$NEW_ACCT"
+  out=$(own_try "$r" "$NEW_ACCT" <<<'refuse_unowned_paths; require_owned_account; ensure_user
+if account_marker_matches; then echo marker-ok; fi')
+  check_has "full disk, after the recovery: the rerun creates the account" "$out" "Created system user: $NEW_ACCT"
+  check_has "full disk, after the recovery: with its marker" "$out" "marker-ok"
+  check_lacks "full disk, after the recovery: nothing is refused" "$out" "DIE:"
+  own_umount "$r/var"; userdel "$NEW_ACCT" 2>/dev/null || true
+  # A marker that is renamed into place but does not read back is removed
+  # again, so the data directory can go too and the recovery still works.
+  # (Forced: the check after the rename is made to fail.)
+  r=$(own_new marker-readback)
+  out=$(own_try "$r" "$NEW_ACCT" <<<'account_marker_matches() { return 1; }; ensure_user; echo after-ensure-user')
+  marker_fail_checks "no read-back" "$out" "$r"
+  check_has "no read-back: the cause is named" "$out" "it was written but does not read back as UID="
+  check_false "no read-back: the data directory it made is removed again" test -e "$r/var/salvorias"
+  check_lacks "no read-back: no extra step is needed" "$out" "could not remove it again"
+  userdel "$NEW_ACCT"
+  out=$(own_try "$r" "$NEW_ACCT" <<<'refuse_unowned_paths; require_owned_account; ensure_user
+if account_marker_matches; then echo marker-ok; fi')
+  check_has "no read-back, after the userdel: the rerun creates the account" "$out" "Created system user: $NEW_ACCT"
+  check_has "no read-back, after the userdel: with its marker" "$out" "marker-ok"
+  check_lacks "no read-back, after the userdel: nothing is refused" "$out" "DIE:"
+  userdel "$NEW_ACCT" 2>/dev/null || true
+  # A staging file that cannot be removed is named, and so is the data
+  # directory it keeps in place, with the extra step the recovery then needs.
+  fail_mv='mv() { echo "mv: cannot move: Input/output error" >&2; return 1; }'
+  fail_rm='rm() { return 1; }'
+  r=$(own_new marker-stuck)
+  out=$(own_try "$r" "$NEW_ACCT" <<<"$fail_mv; $fail_rm; ensure_user; echo after-ensure-user")
+  check_has "a stuck staging file: a warning names it" "$out" "WARNING: Could not remove the unfinished marker, $r/var/salvorias/.stage."
+  check_has "a stuck staging file: and says how to remove it" "$out" "Remove it with 'sudo rm -f $r/var/salvorias/.stage."
+  check_has "a stuck staging file: the install still stops" "$out" "DIE: Could not write $r/var/salvorias/installer-account.txt"
+  check_has "a stuck staging file: the kept data directory is a recovery step" "$out" "This run also made $r/var/salvorias and could not remove it again: remove it with 'sudo rm -r $r/var/salvorias' before you rerun"
+  check_lacks "a stuck staging file: nothing after ensure_user runs" "$out" "after-ensure-user"
+  check_false "a stuck staging file: no marker" test -e "$r/var/salvorias/installer-account.txt"
+  rm -r "$r/var/salvorias"; userdel "$NEW_ACCT"
+  out=$(own_try "$r" "$NEW_ACCT" <<<'refuse_unowned_paths; require_owned_account; ensure_user
+if account_marker_matches; then echo marker-ok; fi')
+  check_has "a stuck staging file, after the steps given: the rerun works" "$out" "marker-ok"
+  check_lacks "a stuck staging file, after the steps given: nothing is refused" "$out" "DIE:"
+  userdel "$NEW_ACCT" 2>/dev/null || true
+
+  # The install's second write, after make_dirs: the line itself, from install.sh.
+  backstop=$(grep -m 1 'account_marker_matches || write_account_marker || die_account_marker' install.sh)
+  check_has "the install's second marker write is found" "$backstop" "die_account_marker"
+  r=$(own_new backstop-valid); own_marker "$r" "$OWN_UID"
+  out=$(own_try "$r" <<<"$fail_mv; $backstop; echo went-on")
+  check_has "a failed rewrite with a valid marker in place: the install goes on" "$out" "went-on"
+  check "and the marker still proves the account" "$(cat "$r/var/salvorias/installer-account.txt")" "UID=$OWN_UID"
+  check "and no staging file is left" "$(stage_files "$r/var")" "0"
+  r=$(own_new backstop-none); mkdir -p "$r/var/salvorias"
+  out=$(own_try "$r" <<<"$fail_mv; $backstop; echo went-on")
+  check_has "a failed write with no valid marker: the install stops" "$out" "DIE: Could not write $r/var/salvorias/installer-account.txt"
+  check_has "and gives the cause" "$out" "Input/output error"
+  check_lacks "and does not go on" "$out" "went-on"
+  check_false "and leaves no marker" test -e "$r/var/salvorias/installer-account.txt"
+  check "and no staging file" "$(stage_files "$r/var")" "0"
+  r=$(own_new backstop-ok); mkdir -p "$r/var/salvorias"
+  out=$(own_try "$r" <<<"$backstop; account_marker_matches && echo marker-ok")
+  check_has "a write that works: the marker proves the account" "$out" "marker-ok"
+  r=$(own_new marker-short); mkdir -p "$r/var/salvorias"; printf 'UID=%s' "${OWN_UID:0:${#OWN_UID}-1}" >"$r/var/salvorias/installer-account.txt"
+  out=$(own_try "$r" <<<'account_marker_matches && echo valid || echo invalid')
+  check_has "a marker cut short does not prove the account" "$out" "invalid"
+  check "no call to write_account_marker ignores its failure" "$(grep -c '^ *write_account_marker$' install.sh)" "0"
+
+  # The uninstall that keeps the key: the marker must end up proving the
+  # account, or the operator is told how to make it so.
+  useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$NEW_ACCT"
+  new_uid=$(id -u "$NEW_ACCT")
+  kept_try() { own_try "$1" "$NEW_ACCT" <<<"${2:-}record_kept_account; echo uninstall-went-on; if account_marker_matches; then echo marker-ok; fi"; }
+  # Follows the fix the warning gives, as root here, so without the sudo.
+  kept_fix() { local f="${1#*write it with: }"; f="${f%%$'\n'*}"; bash -c "${f//sudo /}"; }
+  r=$(own_new kept-ok); install -d -m 0750 -o root -g "$NEW_ACCT" "$r/var/salvorias"
+  out=$(kept_try "$r")
+  check_lacks "kept key, a sound data directory: no warning" "$out" "WARNING"
+  check_has "kept key, a sound data directory: the marker proves the account" "$out" "marker-ok"
+  for kind in missing not-root; do
+    r=$(own_new "kept-$kind")
+    if [[ "$kind" == not-root ]]; then mkdir -p "$r/var/salvorias"; chown "$NEW_ACCT:$NEW_ACCT" "$r/var/salvorias"; chmod 0700 "$r/var/salvorias"; fi
+    out=$(kept_try "$r")
+    check_has "kept key, data directory $kind: a warning, not silence" "$out" "WARNING: Could not write $r/var/salvorias/installer-account.txt"
+    check_has "kept key, data directory $kind: the cause is named" "$out" "$r/var/salvorias is missing or not owned by root, so the marker was not written"
+    check_has "kept key, data directory $kind: the uninstall goes on" "$out" "uninstall-went-on"
+    check_has "kept key, data directory $kind: the fix is given" "$out" "write it with: sudo install -d -m 0750 -o root -g $NEW_ACCT $r/var/salvorias && t=\$(sudo mktemp $r/var/salvorias/.stage.XXXXXX) && echo 'UID=$new_uid' | sudo tee \"\$t\" >/dev/null && sudo mv -fT \"\$t\" $r/var/salvorias/installer-account.txt"
+    check_true "kept key, data directory $kind: the printed fix runs" kept_fix "$out"
+    out=$(own_try "$r" "$NEW_ACCT" <<<'if account_marker_matches; then echo marker-ok; fi')
+    check_has "kept key, data directory $kind: the fix makes the marker prove the account" "$out" "marker-ok"
+  done
+  # The printed fix never writes through what is already at the marker path:
+  # a link the service planted while it owned the directory, to a root-owned
+  # file or to a directory, is replaced, and its target is untouched.
+  for target in file dir; do
+    r=$(own_new "kept-link-$target"); mkdir -p "$r/var/salvorias"
+    if [[ "$target" == file ]]; then printf 'precious\n' >"$r/victim"; else mkdir "$r/victim"; fi
+    ln -s "$r/victim" "$r/var/salvorias/installer-account.txt"
+    chown -h "$NEW_ACCT:$NEW_ACCT" "$r/var/salvorias" "$r/var/salvorias/installer-account.txt"; chmod 0700 "$r/var/salvorias"
+    out=$(kept_try "$r")
+    check_has "kept key, a planted link to a $target: a warning with the fix" "$out" "write it with: sudo install -d"
+    check_true "kept key, a planted link to a $target: the printed fix runs" kept_fix "$out"
+    if [[ "$target" == file ]]; then
+      check "kept key, a planted link to a file: the file it points to is unchanged" "$(cat "$r/victim")" "precious"
+    else
+      check "kept key, a planted link to a directory: nothing is written into it" "$(find "$r/victim" -mindepth 1 | wc -l | tr -d ' ')" "0"
+    fi
+    check_false "kept key, a planted link to a $target: the link is gone" test -L "$r/var/salvorias/installer-account.txt"
+    check "kept key, a planted link to a $target: the marker is root:root 600, as the installer makes it" "$(stat -c '%U:%G %a' "$r/var/salvorias/installer-account.txt")" "root:root 600"
+    out=$(own_try "$r" "$NEW_ACCT" <<<'if account_marker_matches; then echo marker-ok; fi')
+    check_has "kept key, a planted link to a $target: the marker proves the account" "$out" "marker-ok"
+  done
+  r=$(own_new kept-fail); install -d -m 0750 -o root -g "$NEW_ACCT" "$r/var/salvorias"
+  out=$(kept_try "$r" "$fail_mv; ")
+  check_has "kept key, a failed write: a warning with the cause" "$out" "WARNING: Could not write $r/var/salvorias/installer-account.txt, the record that this installer created the '$NEW_ACCT' account (mv: cannot move: Input/output error)"
+  check_has "kept key, a failed write: the uninstall goes on" "$out" "uninstall-went-on"
+  check "kept key, a failed write: no staging file is left" "$(stage_files "$r/var")" "0"
+  r=$(own_new kept-readback); install -d -m 0750 -o root -g "$NEW_ACCT" "$r/var/salvorias"
+  out=$(kept_try "$r" 'account_marker_matches() { return 1; }; ')
+  check_has "kept key, no read-back: a warning with the cause" "$out" "does not read back as UID=$new_uid"
+  check_false "kept key, no read-back: the marker that did not read back is removed" test -e "$r/var/salvorias/installer-account.txt"
   userdel "$NEW_ACCT" 2>/dev/null || true
   r=$(own_new acct-none)
   out=$(own_try "$r" no-such-account-r12 <<<'require_owned_account; echo passed')
