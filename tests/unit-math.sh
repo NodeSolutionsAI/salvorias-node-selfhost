@@ -729,12 +729,21 @@ echo "data=$(stat -c "%a %U:%G" "$DATA_DIR")"')
     check_false "$1: no marker is left that reads as valid" test -e "$3/var/salvorias/installer-account.txt"
     check "$1: no staging file is left" "$(stage_files "$3/var")" "0"
   }
+  # The df and findmnt checks the message suggests: named on PATH, and they
+  # run (they fail on a path that does not exist). NAME OUTPUT PATH
+  marker_where_checks() {
+    check_has "$1: the checks it suggests name $3" "$2" "(check with 'df -h $3' and 'findmnt -T $3')"
+    check_true "$1: the suggested df runs" bash -c 'df -h "$1" >/dev/null 2>&1' _ "$3"
+    check_true "$1: the suggested findmnt runs" bash -c 'findmnt -T "$1" >/dev/null 2>&1' _ "$3"
+  }
   if id -u "$NEW_ACCT" >/dev/null 2>&1; then userdel "$NEW_ACCT"; fi
   # /var/lib read-only: the data directory itself cannot be made.
   r=$(own_new marker-ro-parent); own_mount "$r/var" ro,mode=0755
   out=$(own_try "$r" "$NEW_ACCT" <<<'ensure_user; echo after-ensure-user')
   marker_fail_checks "read-only /var/lib" "$out" "$r"
   check_has "read-only /var/lib: the cause is named" "$out" "could not create $r/var/salvorias:"
+  marker_where_checks "read-only /var/lib (no data directory)" "$out" "$r/var"
+  check "read-only /var/lib: the suggested findmnt shows the read-only mount" "$(findmnt -n -o OPTIONS -T "$r/var" | tr ',' '\n' | grep -x ro)" "ro"
   check_true "read-only /var/lib: the account exists, as the message says" bash -c 'id -u "$1" >/dev/null' _ "$NEW_ACCT"
   own_umount "$r/var"; userdel "$NEW_ACCT" 2>/dev/null || true
   # A read-only data directory that already exists: no staging file can be made.
@@ -743,6 +752,10 @@ echo "data=$(stat -c "%a %U:%G" "$DATA_DIR")"')
   marker_fail_checks "read-only data directory" "$out" "$r"
   check_has "read-only data directory: the cause is named" "$out" "could not create a file in $r/var/salvorias:"
   check_true "read-only data directory: one it did not make is left in place" test -d "$r/var/salvorias"
+  # It exists, and is a mount of its own here: the checks name it, not its
+  # parent, which would show the parent's (writable) file system.
+  marker_where_checks "read-only data directory (a mount of its own)" "$out" "$r/var/salvorias"
+  check "read-only data directory: the suggested findmnt shows the read-only mount" "$(findmnt -n -o OPTIONS -T "$r/var/salvorias" | tr ',' '\n' | grep -x ro)" "ro"
   own_umount "$r/var/salvorias"; userdel "$NEW_ACCT" 2>/dev/null || true
   # A full disk: the directory and the staging file are made, the write fails.
   r=$(own_new marker-full); own_mount "$r/var" size=8k,mode=0755
@@ -751,6 +764,8 @@ echo "data=$(stat -c "%a %U:%G" "$DATA_DIR")"')
   marker_fail_checks "full disk" "$out" "$r"
   check_has "full disk: the cause is named" "$out" "No space left on device"
   check_false "full disk: the data directory it made is removed again" test -e "$r/var/salvorias"
+  marker_where_checks "full disk (data directory removed again)" "$out" "$r/var"
+  check_has "full disk: the suggested df shows the full file system" "$(df -h "$r/var")" "100%"
   # The recovery the message gives: free space, userdel, rerun.
   rm -f "$r/var/fill"; userdel "$NEW_ACCT"
   out=$(own_try "$r" "$NEW_ACCT" <<<'refuse_unowned_paths; require_owned_account; ensure_user
@@ -768,6 +783,7 @@ if account_marker_matches; then echo marker-ok; fi')
   check_has "no read-back: the cause is named" "$out" "it was written but does not read back as UID="
   check_false "no read-back: the data directory it made is removed again" test -e "$r/var/salvorias"
   check_lacks "no read-back: no extra step is needed" "$out" "could not remove it again"
+  marker_where_checks "no read-back (data directory removed again)" "$out" "$r/var"
   userdel "$NEW_ACCT"
   out=$(own_try "$r" "$NEW_ACCT" <<<'refuse_unowned_paths; require_owned_account; ensure_user
 if account_marker_matches; then echo marker-ok; fi')
@@ -785,6 +801,7 @@ if account_marker_matches; then echo marker-ok; fi')
   check_has "a stuck staging file: and says how to remove it" "$out" "Remove it with 'sudo rm -f $r/var/salvorias/.stage."
   check_has "a stuck staging file: the install still stops" "$out" "DIE: Could not write $r/var/salvorias/installer-account.txt"
   check_has "a stuck staging file: the kept data directory is a recovery step" "$out" "This run also made $r/var/salvorias and could not remove it again: remove it with 'sudo rm -r $r/var/salvorias' before you rerun"
+  marker_where_checks "a stuck staging file (data directory kept)" "$out" "$r/var/salvorias"
   check_lacks "a stuck staging file: nothing after ensure_user runs" "$out" "after-ensure-user"
   check_false "a stuck staging file: no marker" test -e "$r/var/salvorias/installer-account.txt"
   rm -r "$r/var/salvorias"; userdel "$NEW_ACCT"
@@ -866,6 +883,28 @@ if account_marker_matches; then echo marker-ok; fi')
   check_has "kept key, a failed write: a warning with the cause" "$out" "WARNING: Could not write $r/var/salvorias/installer-account.txt, the record that this installer created the '$NEW_ACCT' account (mv: cannot move: Input/output error)"
   check_has "kept key, a failed write: the uninstall goes on" "$out" "uninstall-went-on"
   check "kept key, a failed write: no staging file is left" "$(stage_files "$r/var")" "0"
+  # A marker that already proves the account (the usual case: the install
+  # wrote it) is left as it is, so a write that would fail never runs and
+  # never warns about a marker that is fine. Forced first, then on a real
+  # full disk.
+  r=$(own_new kept-valid-fail); own_marker "$r" "$new_uid"; chgrp "$NEW_ACCT" "$r/var/salvorias"; chmod 0750 "$r/var/salvorias"
+  out=$(kept_try "$r" "$fail_mv; ")
+  check_lacks "kept key, a valid marker and a write that would fail: no warning" "$out" "WARNING"
+  check_has "kept key, a valid marker and a write that would fail: the uninstall goes on" "$out" "uninstall-went-on"
+  check_has "kept key, a valid marker and a write that would fail: the marker still proves the account" "$out" "marker-ok"
+  check "kept key, a valid marker and a write that would fail: its content is unchanged" "$(cat "$r/var/salvorias/installer-account.txt")" "UID=$new_uid"
+  check "kept key, a valid marker and a write that would fail: no staging file" "$(stage_files "$r/var")" "0"
+  r=$(own_new kept-valid-full); own_mount "$r/var" size=8k,mode=0755
+  own_marker "$r" "$new_uid"; chgrp "$NEW_ACCT" "$r/var/salvorias"; chmod 0750 "$r/var/salvorias"
+  head -c 8192 /dev/zero >"$r/var/fill" 2>/dev/null || true
+  check_false "kept key, a valid marker on a full disk: the disk really is full" bash -c 'printf x >"$1"' _ "$r/var/probe"
+  rm -f "$r/var/probe"
+  out=$(kept_try "$r")
+  check_lacks "kept key, a valid marker on a full disk: no warning" "$out" "WARNING"
+  check_has "kept key, a valid marker on a full disk: the uninstall goes on" "$out" "uninstall-went-on"
+  check_has "kept key, a valid marker on a full disk: the marker still proves the account" "$out" "marker-ok"
+  check "kept key, a valid marker on a full disk: no staging file" "$(stage_files "$r/var")" "0"
+  own_umount "$r/var"
   r=$(own_new kept-readback); install -d -m 0750 -o root -g "$NEW_ACCT" "$r/var/salvorias"
   out=$(kept_try "$r" 'account_marker_matches() { return 1; }; ')
   check_has "kept key, no read-back: a warning with the cause" "$out" "does not read back as UID=$new_uid"

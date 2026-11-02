@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-INSTALLER_VERSION="0.1.2"
+INSTALLER_VERSION="0.1.3"
 
 # ─── Configuration (environment overrides) ────────────────────────────────
 
@@ -1129,8 +1129,10 @@ account_marker_matches() {
 # complete, and is removed otherwise.
 #
 # Returns 0 with nothing written when there is nothing to prove yet: no such
-# account, or a DATA_DIR that is not root-owned (an older layout, which
-# make_dirs fixes before the install writes the marker again). Returns 1, with
+# account, or a DATA_DIR that is missing or not root-owned. An install does
+# not meet the second (ensure_user makes DATA_DIR itself for a new account);
+# a hand-edited server at uninstall can, and record_kept_account checks the
+# marker afterwards and warns. Returns 1, with
 # MARKER_ERROR saying why, when the write failed or the marker does not read
 # back as valid; the caller decides whether that stops the run.
 MARKER_ERROR=""
@@ -1178,19 +1180,31 @@ undo_new_data_dir() {
 # would leave an account the next install cannot prove is its own, and so
 # refuses. Always this run's account: one reused from an earlier install has a
 # valid marker, which the install never rewrites.
-# die_account_marker WHY [EXTRA]: EXTRA is one more recovery step.
+# die_account_marker WHY [EXTRA]: EXTRA is one more recovery step. The checks
+# it suggests name DATA_DIR only while it exists. For a new account it may
+# never have been made (a read-only /var/lib) or has been removed again
+# (undo_new_data_dir runs before this, as an argument), and df and findmnt
+# fail on a missing path; its parent always exists and is the file system
+# DATA_DIR would be made on. A DATA_DIR that does exist is named itself, as
+# it may be a mount of its own, which the parent would not show.
 die_account_marker() {
-  die "Could not write $ACCOUNT_MARKER, the record that this installer created the '$SERVICE_USER' account ($1). Stopping here: without it the next install could not prove the account is its own and would refuse it. The disk may be full or $DATA_DIR read-only (check with 'df -h $DATA_DIR' and 'findmnt -T $DATA_DIR'). Free space or fix that, then remove the account this run created with 'sudo userdel $SERVICE_USER' (it removes the group too), and rerun.${2:+ $2}"
+  local where=$DATA_DIR
+  [[ -e "$where" ]] || where=${DATA_DIR%/*}
+  die "Could not write $ACCOUNT_MARKER, the record that this installer created the '$SERVICE_USER' account ($1). Stopping here: without it the next install could not prove the account is its own and would refuse it. The disk may be full or $DATA_DIR read-only (check with 'df -h $where' and 'findmnt -T $where'). Free space or fix that, then remove the account this run created with 'sudo userdel $SERVICE_USER' (it removes the group too), and rerun.${2:+ $2}"
 }
 
 # The uninstall that keeps the key removes the state file, so from then on
 # only ACCOUNT_MARKER shows the next install that the kept account (and key)
-# are this installer's. Writes it, then checks that it really proves the
-# account: write_account_marker writes nothing when DATA_DIR is missing or not
+# are this installer's. A marker that already proves the account (the usual
+# case: the install wrote it) is left as it is, as the install does: a rewrite
+# could only fail (a full disk) and warn about a marker that is fine. Without
+# one, writes it, then checks that it really proves the account:
+# write_account_marker writes nothing when DATA_DIR is missing or not
 # root-owned, which no release leaves behind but a hand-edited server can.
 # Anything short of proof gets a warning with the fix, not a stop: the
 # uninstall itself is done by then.
 record_kept_account() {
+  account_marker_matches && return 0
   local why=""
   if ! write_account_marker; then
     why=$MARKER_ERROR
@@ -2009,13 +2023,15 @@ cmd_install() {
   refuse_unowned_paths
   ensure_user
   make_dirs
-  # ensure_user wrote the marker for a new account before any of this. This
-  # call covers a DATA_DIR that existed but was not root-owned then (an older
-  # layout), which make_dirs has just fixed. A marker that already proves the
-  # account is left as it is: rewriting it would only add a way to lose it
-  # (a write that does not read back is removed). With no valid marker, a
-  # failed write stops the install as in ensure_user; the account is then
-  # always this run's, since a reused one is reused only on a valid marker.
+  # A backstop that should not fire: ensure_user either leaves a marker that
+  # proves a new account or stops the run (guard_single_node and
+  # refuse_unowned_paths make sure it is the one to create DATA_DIR), and a
+  # reused account is reused only on a valid marker. It is here so that the
+  # install never goes on, after make_dirs, without that proof, whatever
+  # happened in between. A marker that already proves the account is left as
+  # it is: rewriting it would only add a way to lose it (a write that does
+  # not read back is removed). Otherwise a failed write stops the install as
+  # in ensure_user.
   if [[ "$ACCOUNT_CREATED" == yes ]]; then
     account_marker_matches || write_account_marker || die_account_marker "$MARKER_ERROR"
   fi
