@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-INSTALLER_VERSION="0.1.2"
+INSTALLER_VERSION="0.1.3"
 
 # ─── Configuration (environment overrides) ────────────────────────────────
 
@@ -1067,10 +1067,21 @@ ensure_user() {
     saved=$(trap -p INT TERM HUP)
     trap 'held=1' INT TERM HUP
     useradd --system --user-group --no-create-home --home-dir /nonexistent --shell "$nologin" "$SERVICE_USER"
+    # From here a failure must stop the run with the way out, not leave an
+    # account that the next install refuses. A DATA_DIR this made is removed
+    # again, or the next install would refuse it as unproven; the userdel the
+    # message asks for is then all it needs.
+    local made_dir=0 err
     if [[ ! -e "$DATA_DIR" && ! -L "$DATA_DIR" ]]; then
-      install -d -m 0750 -o root -g "$SERVICE_USER" "$DATA_DIR"
+      made_dir=1
+      if ! err=$(install -d -m 0750 -o root -g "$SERVICE_USER" "$DATA_DIR" 2>&1); then
+        die_account_marker "could not create $DATA_DIR: $(clean_text "$err")" "$(undo_new_data_dir)"
+      fi
     fi
-    write_account_marker
+    if ! write_account_marker; then
+      if (( made_dir == 1 )); then die_account_marker "$MARKER_ERROR" "$(undo_new_data_dir)"; fi
+      die_account_marker "$MARKER_ERROR"
+    fi
     trap - INT TERM HUP
     eval "$saved"
     if [[ -n "$held" ]]; then kill -s INT "$$"; fi
@@ -1110,17 +1121,106 @@ account_marker_matches() {
   [[ "$(head -c 100 -- "$ACCOUNT_MARKER" | head -n 1)" == "UID=$uid" ]]
 }
 
-# Leaves ACCOUNT_MARKER for the account this installer created, when an
-# uninstall keeps the key (and so the account) but removes the state file.
-# Written in a staging name and renamed, so it never follows a link.
+# Leaves ACCOUNT_MARKER for the account this installer created: for a new
+# account (ensure_user), and when an uninstall keeps the key (and so the
+# account) but removes the state file. Written in a staging name and renamed,
+# so it never follows a link, and so a write that fails part-way (a full disk)
+# never leaves a marker behind: the staging file is renamed only once it is
+# complete, and is removed otherwise.
+#
+# Returns 0 with nothing written when there is nothing to prove yet: no such
+# account, or a DATA_DIR that is missing or not root-owned. An install does
+# not meet the second (ensure_user makes DATA_DIR itself for a new account);
+# a hand-edited server at uninstall can, and record_kept_account checks the
+# marker afterwards and warns. Returns 1, with
+# MARKER_ERROR saying why, when the write failed or the marker does not read
+# back as valid; the caller decides whether that stops the run.
+MARKER_ERROR=""
 write_account_marker() {
-  local uid tmp
+  local uid tmp err
+  MARKER_ERROR=""
   uid=$(id -u "$SERVICE_USER" 2>/dev/null) || return 0
   [[ -d "$DATA_DIR" && ! -L "$DATA_DIR" && "$(stat -c '%u' -- "$DATA_DIR")" == 0 ]] || return 0
-  tmp=$(mktemp "$DATA_DIR/.stage.XXXXXX") || return 0
-  printf 'UID=%s\n' "$uid" >"$tmp"
-  chmod 0600 "$tmp"
-  mv -fT -- "$tmp" "$ACCOUNT_MARKER"
+  if ! tmp=$(mktemp "$DATA_DIR/.stage.XXXXXX" 2>&1); then
+    MARKER_ERROR="could not create a file in $DATA_DIR: $(clean_text "$tmp")"
+    return 1
+  fi
+  if ! err=$({ printf 'UID=%s\n' "$uid" >"$tmp" && chmod 0600 "$tmp" && mv -fT -- "$tmp" "$ACCOUNT_MARKER"; } 2>&1); then
+    MARKER_ERROR=$(clean_text "${err:-the write failed}")
+    remove_marker_file "$tmp" "the unfinished marker"
+    return 1
+  fi
+  # A marker that does not prove the account is worse than none: it would
+  # keep DATA_DIR from being removed again, and the next install refuses
+  # that. It is the file just renamed into a root-owned DATA_DIR, so ours.
+  if ! account_marker_matches; then
+    MARKER_ERROR="it was written but does not read back as UID=$uid"
+    remove_marker_file "$ACCOUNT_MARKER" "the marker that did not read back"
+    return 1
+  fi
+}
+
+# remove_marker_file PATH WHAT: removes a file write_account_marker made. rm
+# removes a link itself and never follows it. When it cannot, the path is
+# named so the operator can remove it by hand.
+remove_marker_file() {
+  if [[ ! -e "$1" && ! -L "$1" ]] || rm -f -- "$1" 2>/dev/null; then return 0; fi
+  warn "Could not remove $2, $1. Remove it with 'sudo rm -f $1'."
+}
+
+# After a failed marker write for a new account: removes the DATA_DIR that
+# ensure_user has just made (rmdir, so only while it is empty) and prints
+# nothing. When it cannot, prints the extra step for die_account_marker.
+undo_new_data_dir() {
+  if [[ ! -e "$DATA_DIR" && ! -L "$DATA_DIR" ]] || rmdir -- "$DATA_DIR" 2>/dev/null; then return 0; fi
+  printf "This run also made %s and could not remove it again: remove it with 'sudo rm -r %s' before you rerun, or the next install will refuse it." "$DATA_DIR" "$DATA_DIR"
+}
+
+# Stops an install whose new account could not get its marker. Carrying on
+# would leave an account the next install cannot prove is its own, and so
+# refuses. Always this run's account: one reused from an earlier install has a
+# valid marker, which the install never rewrites.
+# die_account_marker WHY [EXTRA]: EXTRA is one more recovery step. The checks
+# it suggests name DATA_DIR only while it exists. For a new account it may
+# never have been made (a read-only /var/lib) or has been removed again
+# (undo_new_data_dir runs before this, as an argument), and df and findmnt
+# fail on a missing path; its parent always exists and is the file system
+# DATA_DIR would be made on. A DATA_DIR that does exist is named itself, as
+# it may be a mount of its own, which the parent would not show.
+die_account_marker() {
+  local where=$DATA_DIR
+  [[ -e "$where" ]] || where=${DATA_DIR%/*}
+  die "Could not write $ACCOUNT_MARKER, the record that this installer created the '$SERVICE_USER' account ($1). Stopping here: without it the next install could not prove the account is its own and would refuse it. The disk may be full or $DATA_DIR read-only (check with 'df -h $where' and 'findmnt -T $where'). Free space or fix that, then remove the account this run created with 'sudo userdel $SERVICE_USER' (it removes the group too), and rerun.${2:+ $2}"
+}
+
+# The uninstall that keeps the key removes the state file, so from then on
+# only ACCOUNT_MARKER shows the next install that the kept account (and key)
+# are this installer's. A marker that already proves the account (the usual
+# case: the install wrote it) is left as it is, as the install does: a rewrite
+# could only fail (a full disk) and warn about a marker that is fine. Without
+# one, writes it, then checks that it really proves the account:
+# write_account_marker writes nothing when DATA_DIR is missing or not
+# root-owned, which no release leaves behind but a hand-edited server can.
+# Anything short of proof gets a warning with the fix, not a stop: the
+# uninstall itself is done by then.
+record_kept_account() {
+  account_marker_matches && return 0
+  local why=""
+  if ! write_account_marker; then
+    why=$MARKER_ERROR
+  elif ! account_marker_matches; then
+    why="$DATA_DIR is missing or not owned by root, so the marker was not written"
+  fi
+  if [[ -z "$why" ]]; then return 0; fi
+  # The fix writes the marker as write_account_marker does, so that nothing
+  # placed at the marker path is written through: the directory is made
+  # root-only first (from then on only root can put anything in it), the
+  # content goes into a new file mktemp creates exclusively (root, 0600), and
+  # mv -T renames that over whatever is at the marker path, replacing a link
+  # rather than following it.
+  local uid
+  uid=$(id -u "$SERVICE_USER" 2>/dev/null || printf '?')
+  warn "Could not write $ACCOUNT_MARKER, the record that this installer created the '$SERVICE_USER' account ($why). Without it a later install will refuse the account and the kept key. Free space on the disk if it is full, then write it with: sudo install -d -m 0750 -o root -g $SERVICE_USER $DATA_DIR && t=\$(sudo mktemp $DATA_DIR/.stage.XXXXXX) && echo 'UID=$uid' | sudo tee \"\$t\" >/dev/null && sudo mv -fT \"\$t\" $ACCOUNT_MARKER"
 }
 
 # True when the state file is one this installer wrote: a root-owned regular
@@ -1923,10 +2023,18 @@ cmd_install() {
   refuse_unowned_paths
   ensure_user
   make_dirs
-  # ensure_user wrote the marker for a new account before any of this. This
-  # call covers a DATA_DIR that existed but was not root-owned then (an older
-  # layout), which make_dirs has just fixed; it rewrites the same marker.
-  if [[ "$ACCOUNT_CREATED" == yes ]]; then write_account_marker; fi
+  # A backstop that should not fire: ensure_user either leaves a marker that
+  # proves a new account or stops the run (guard_single_node and
+  # refuse_unowned_paths make sure it is the one to create DATA_DIR), and a
+  # reused account is reused only on a valid marker. It is here so that the
+  # install never goes on, after make_dirs, without that proof, whatever
+  # happened in between. A marker that already proves the account is left as
+  # it is: rewriting it would only add a way to lose it (a write that does
+  # not read back is removed). Otherwise a failed write stops the install as
+  # in ensure_user.
+  if [[ "$ACCOUNT_CREATED" == yes ]]; then
+    account_marker_matches || write_account_marker || die_account_marker "$MARKER_ERROR"
+  fi
   place_binary
   switch_current "$PLACED_NAME"
   say "Installed salvorias-node $STAGED_VERSION at $BIN_ROOT/$PLACED_NAME (linked from $PATH_LINK)"
@@ -2537,7 +2645,7 @@ cmd_uninstall() {
   # The state file is gone now; the marker carries "this installer created
   # the account" to the next install, which reuses the kept key and account.
   if (( OPT_PURGE_KEY == 0 )) && [[ "$account_created" == "yes" ]]; then
-    write_account_marker
+    record_kept_account
   fi
 
   # The license is not freed by an uninstall, and the app counts this node as
